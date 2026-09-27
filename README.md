@@ -56,23 +56,12 @@
 
 ## 🚀 快速开始
 
-### 1. 下载脚本
+### 1. 安装脚本
 
 ```bash
-wget -O install.sh https://raw.githubusercontent.com/SunMoonWithYou/reality_vision_caddy/main/install.sh
+bash <(curl -fsSL https://raw.githubusercontent.com/SunMoonWithYou/reality_vision_caddy/main/install.sh)
 ```
 
-### 2. 赋予执行权限
-
-```bash
-chmod +x install.sh
-```
-
-### 3. 运行
-
-```bash
-sudo ./install.sh
-```
 
 ### 4. 选择菜单
 
