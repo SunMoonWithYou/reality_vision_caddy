@@ -9,10 +9,16 @@
 #                 默认监听端口 443
 #      - IP模式  ：仅安装 Xray(Reality+Vision)，不需要域名、不安装 Caddy
 #                 默认监听端口 8443，需选择一个真实网站作为伪装目标
-#   2) 卸载      ：停止并移除服务、配置，可选清理伪装站和安装信息
+#   2) 卸载      ：停止并移除服务、配置，可选清理安装信息
+#                 卸载逻辑按安装模式区分：IP 模式不会去动 Caddy 相关的东西
 #   3) 查看状态  ：展示服务运行状态、端口监听、版本信息
 #   4) 客户端参数：输出指定用户的 VLESS 分享链接和详细参数
 #   5) 用户管理  ：列出 / 添加 / 删除用户，并实时重建 Xray 配置
+#
+# 端口说明：
+#   两种模式安装完成后，脚本都会提示需要在防火墙 / 云厂商安全组放行端口
+#   - 域名模式：放行 80(申请证书) + 443(或自定义的 Xray 端口)
+#   - IP模式  ：放行 Xray 监听端口(默认 8443)
 #
 # 适用系统：Debian 11/12/13、Ubuntu 20.04/22.04/24.04
 # 必须以 root 用户运行
@@ -82,7 +88,6 @@ BUILTIN_DESTS=(
   "www.paypal.com"
   "aws.amazon.com"
   "www.apple.com"
-  "dl.google.com"
   "www.bing.com"
   "www.yahoo.com"
 )
@@ -112,7 +117,7 @@ EOF
 
 # ============================================================================
 # 判断本机是否已安装本方案
-# 判断依据：存在 info.txt 文件，或存在 caddy-json.service
+# 判断依据：存在 info.txt 文件，或存在 caddy-json.service（域名模式）
 # ============================================================================
 is_installed() {
   [[ -f "$INFO_FILE" ]] || systemctl list-unit-files 2>/dev/null | grep -q "^caddy-json.service"
@@ -252,6 +257,81 @@ EOF
     return 1
   fi
   return 0
+}
+
+# ============================================================================
+# 检测并尝试自动放行端口（firewalld / ufw / iptables）
+# 注意：云服务器还需要在云厂商控制台的安全组里放行，脚本无法代劳
+# 用法：open_firewall_port 8443 443 80
+# ============================================================================
+open_firewall_port() {
+  local ports=("$@")
+  local opened=0
+
+  # firewalld（Debian/Ubuntu 上一般不装，装了才会走这里）
+  if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld 2>/dev/null; then
+    for p in "${ports[@]}"; do
+      firewall-cmd --permanent --add-port="${p}/tcp" >/dev/null 2>&1 || true
+    done
+    firewall-cmd --reload >/dev/null 2>&1 || true
+    info "firewalld: 已放行 TCP ${ports[*]}"
+    opened=1
+  fi
+
+  # ufw（Ubuntu 常见）
+  if command -v ufw >/dev/null 2>&1; then
+    local st
+    st=$(ufw status 2>/dev/null | head -n1 || true)
+    if [[ "$st" == *"active"* ]]; then
+      for p in "${ports[@]}"; do
+        ufw allow "${p}/tcp" >/dev/null 2>&1 || true
+      done
+      info "ufw: 已放行 TCP ${ports[*]}"
+      opened=1
+    fi
+  fi
+
+  # iptables：仅作为最后兜底（无 firewalld/ufw 时）
+  if [[ $opened -eq 0 ]] && command -v iptables >/dev/null 2>&1; then
+    local changed=0
+    for p in "${ports[@]}"; do
+      iptables -C INPUT -p tcp --dport "$p" -j ACCEPT 2>/dev/null && continue
+      iptables -I INPUT -p tcp --dport "$p" -j ACCEPT 2>/dev/null && changed=1 || true
+    done
+    if [[ $changed -eq 1 ]]; then
+      # 持久化（若已安装 iptables-persistent / netfilter-persistent）
+      command -v netfilter-persistent >/dev/null 2>&1 && netfilter-persistent save >/dev/null 2>&1 || true
+      info "iptables: 已放行 TCP ${ports[*]}（重启后可能失效，建议改用 ufw/firewalld）"
+      opened=1
+    fi
+  fi
+
+  # 未检测到任何启用的防火墙：通常说明云主机仅靠安全组控制
+  if [[ $opened -eq 0 ]]; then
+    info "未检测到启用中的本机防火墙（firewalld/ufw/iptables 规则为空）"
+  fi
+}
+
+# ============================================================================
+# 端口放行提示（域名模式与 IP 模式共用）
+# 参数：<模式> <Xray端口>
+# ============================================================================
+print_port_notice() {
+  local mode=$1
+  local port=$2
+
+  echo
+  echo -e "${YELLOW}───────────────────────── 端口放行提醒 ─────────────────────────${NC}"
+  if [[ "$mode" == "ip" ]]; then
+    echo -e "  必须放行：${CYAN}TCP ${port}${NC}（Xray 监听端口）"
+  else
+    echo -e "  必须放行：${CYAN}TCP 80${NC}（ACME 申请/续期证书）"
+    echo -e "            ${CYAN}TCP ${port}${NC}（Xray 监听端口，默认 443）"
+  fi
+  echo -e "  操作位置：云厂商控制台 → 安全组 / 防火墙 入站规则"
+  echo -e "            以及服务器本机防火墙（ufw / firewalld）"
+  echo -e "  提示    ：端口未放行时，客户端会连接超时或 TLS 握手失败"
+  echo -e "${YELLOW}───────────────────────────────────────────────────────────────${NC}"
 }
 
 # ============================================================================
@@ -546,6 +626,9 @@ do_install() {
     CADDY_BIN=$(command -v caddy)
     [[ -z "$CADDY_BIN" || ! -x "$CADDY_BIN" ]] && error "Caddy 安装失败"
     info "Caddy: $($CADDY_BIN version)"
+  else
+    # IP 模式：不安装 Caddy，也不部署伪装站点
+    info "IP 模式：跳过 Caddy 安装与伪装站部署"
   fi
 
   # ---------- 安装 Xray ----------
@@ -568,6 +651,14 @@ do_install() {
     fi
   fi
   configure_log_retention
+
+  # ---------- 放行端口（本机防火墙） ----------
+  step "放行防火墙端口"
+  if [[ "$MODE" == "domain" ]]; then
+    open_firewall_port 80 "$XRAY_PORT"
+  else
+    open_firewall_port "$XRAY_PORT"
+  fi
 
   # ---------- 生成 Reality 密钥 ----------
   step "生成 Reality 密钥"
@@ -751,12 +842,20 @@ EOF
 
   echo
   show_client_info
+
+  # ---------- 端口放行提醒（两种模式都提示） ----------
+  print_port_notice "$MODE" "$XRAY_PORT"
+
   info "安装完成！"
   read -rp "按回车返回主菜单..." _
 }
 
 # ============================================================================
 # 二、卸载
+# 按安装模式区分清理动作：
+#   - Xray、users.txt / info.txt：两种模式都清理
+#   - Caddy、/etc/caddy、/var/www/html：仅域名模式（且实际存在的）才处理
+#   - IP 模式下不存在 Caddy 与伪装站，脚本不会做多余操作
 # ============================================================================
 do_uninstall() {
   if ! is_installed; then
@@ -766,41 +865,62 @@ do_uninstall() {
   fi
 
   echo
+  local MODE=""
   load_kv "$INFO_FILE" 2>/dev/null || true
-  warn "即将卸载（模式: ${MODE:-domain}）"
+  [[ -z "$MODE" ]] && MODE="domain"
+  warn "即将卸载（模式: ${MODE}）"
   read -rp "确认卸载？输入 yes 继续: " CONFIRM
   [[ "$CONFIRM" != "yes" ]] && { info "已取消"; return; }
 
-  # 停止并删除 Caddy 服务
-  systemctl stop caddy-json.service 2>/dev/null || true
-  systemctl disable caddy-json.service 2>/dev/null || true
-  rm -f /etc/systemd/system/caddy-json.service
-
-  # 停止并删除 Xray 服务
+  # ---------- 停止并删除 Xray 服务（两种模式都要做） ----------
   systemctl stop xray 2>/dev/null || true
   systemctl disable xray 2>/dev/null || true
+
+  # ---------- 域名模式：停止并删除 Caddy 服务 ----------
+  if [[ "$MODE" == "domain" ]]; then
+    systemctl stop caddy-json.service 2>/dev/null || true
+    systemctl disable caddy-json.service 2>/dev/null || true
+    rm -f /etc/systemd/system/caddy-json.service
+  fi
   systemctl daemon-reload
 
-  # 卸载 Caddy 软件包及残留
-  dpkg -l 2>/dev/null | grep -q "^ii  caddy " && apt-get purge -y caddy || true
-  rm -f /etc/apt/sources.list.d/caddy-stable.list
-  rm -f /usr/share/keyrings/caddy-stable-archive-keyring.gpg
-  rm -rf /etc/caddy /var/lib/caddy
+  # ---------- 域名模式：卸载 Caddy 软件包及残留 ----------
+  # 用 is-active / 目录存在性判断，避免对从未安装过 Caddy 的机器做多余操作
+  if [[ "$MODE" == "domain" ]] || [[ -d /etc/caddy ]] || systemctl list-unit-files 2>/dev/null | grep -q "^caddy.service"; then
+    if dpkg -l 2>/dev/null | grep -q "^ii  caddy "; then
+      info "卸载 Caddy 软件包"
+      apt-get purge -y caddy || true
+    fi
+    rm -f /etc/apt/sources.list.d/caddy-stable.list
+    rm -f /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+    rm -rf /etc/caddy /var/lib/caddy
+    info "Caddy 相关文件已清理"
+  fi
 
-  # 使用官方脚本卸载 Xray
+  # ---------- 使用官方脚本卸载 Xray ----------
   [[ -f /usr/local/bin/xray ]] && \
     bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ remove --purge || true
   rm -rf /usr/local/etc/xray /var/log/xray
 
-  # 可选：删除安装信息目录
+  # ---------- 可选：删除安装信息目录 ----------
   read -rp "删除 /etc/reality-caddy ? [y/N]: " DEL
   [[ "${DEL,,}" == "y" ]] && rm -rf /etc/reality-caddy && info "已删除"
 
-  # 可选：删除伪装站目录
-  read -rp "删除伪装站 /var/www/html ? [y/N]: " DEL
-  [[ "${DEL,,}" == "y" ]] && rm -rf /var/www/html && info "已删除"
+  # ---------- 可选：删除伪装站目录（仅域名模式下存在） ----------
+  if [[ "$MODE" == "domain" && -d /var/www/html ]]; then
+    read -rp "删除伪装站 /var/www/html ? [y/N]: " DEL
+    [[ "${DEL,,}" == "y" ]] && rm -rf /var/www/html && info "已删除"
+  fi
 
-  info "卸载完成"
+  # ---------- 卸载后端口提示 ----------
+  echo
+  if [[ "$MODE" == "ip" ]]; then
+    info "IP 模式卸载完成（本机未安装 Caddy，也未部署伪装页面）"
+    warn "如需彻底断服，请记得在云厂商安全组中删除 TCP ${XRAY_PORT:-8443} 的放行规则"
+  else
+    info "域名模式卸载完成"
+    warn "如需彻底断服，请记得在云厂商安全组中删除 TCP 80/443 的放行规则"
+  fi
   read -rp "按回车返回..." _
 }
 
@@ -841,6 +961,9 @@ do_status() {
 
   # 版本信息
   command -v xray >/dev/null && xray version | head -1
+
+  # 端口放行提醒
+  print_port_notice "${MODE:-domain}" "${XRAY_PORT}"
   read -rp "按回车返回..." _
 }
 
