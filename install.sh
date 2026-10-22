@@ -34,6 +34,9 @@ DIM='\033[2m'         # 暗色 - 说明文字
 BOLD='\033[1m'        # 粗体 - 小标题
 NC='\033[0m'          # 重置颜色
 
+# 标记 Go 是否由本脚本安装（决定编译完成后是否自动删除，避免误删用户自装的 Go）
+GO_INSTALLED_BY_SCRIPT=0
+
 # 信息输出函数
 info()  { echo -e "${GREEN}[INFO]${NC} $*"; }
 warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
@@ -789,7 +792,7 @@ do_install() {
     echo -e "  ${BLUE}▶ 证书验证方式${NC}"
     line
     mi 1 "HTTP 验证" "HTTP-01，需占用 80 端口，配置最简单"
-    mi 2 "DNS 验证"  "DNS-01，不占用 80，走 Cloudflare API（自动使用假邮箱）"
+    mi 2 "DNS 验证"  "DNS-01，不占用 80，走 Cloudflare API"
     line
     echo
     read -rp "  请选择 [1-2] (默认 1): " ACME_CHALLENGE_SEL
@@ -801,13 +804,19 @@ do_install() {
     fi
 
     # 根据验证方式处理邮箱
-    # DNS-01 使用假邮箱即可满足 ACME 账号注册要求
+    # 注意：Let's Encrypt 禁止使用 example.com 等保留域名的邮箱注册 ACME 账号
+    # (HTTP 400 invalidContact: forbidden domain)，会导致证书签发失败。
+    # 两种模式均需用户手动输入邮箱，并校验格式与保留域名。
+    read -rp "  请输入用于 ACME 的邮箱 (如 admin@${DOMAIN}): " EMAIL
+    [[ -z "$EMAIL" ]] && error "邮箱不能为空"
+    if ! [[ "$EMAIL" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+$ ]]; then
+      error "邮箱格式不合法: $EMAIL"
+    fi
+    if [[ "$EMAIL" =~ @(example\.com|example\.org|example\.net)$ ]]; then
+      error "Let's Encrypt 禁止使用 example.com/org/net 域名的邮箱（invalidContact），请换一个"
+    fi
     if [[ "$ACME_CHALLENGE" == "dns" ]]; then
-      EMAIL="admin@example.com"
-      info "DNS-01 模式：自动使用假邮箱 ${EMAIL}（仅用于 ACME 账号注册）"
-    else
-      read -rp "  请输入用于 ACME 的邮箱: " EMAIL
-      [[ -z "$EMAIL" ]] && error "邮箱不能为空"
+      info "DNS-01 模式：使用邮箱 ${EMAIL} 注册 ACME 账号"
     fi
 
     read -rp "  请输入伪装站标题 (默认: Welcome): " SITE_TITLE
@@ -866,6 +875,7 @@ do_install() {
       # 安装足够新的 Go
       if ! command -v go >/dev/null 2>&1 || ! go version 2>/dev/null | grep -qE 'go1\.(2[1-9]|[3-9][0-9])'; then
         info "安装 Go 1.22（官方二进制）"
+        GO_INSTALLED_BY_SCRIPT=1
         local ARCH
         case "$(dpkg --print-architecture)" in
           amd64) ARCH="amd64" ;;
@@ -880,8 +890,10 @@ do_install() {
       fi
 
       export PATH="$PATH:/usr/local/go/bin:$(go env GOPATH)/bin"
+      XCADDY_INSTALLED_BY_SCRIPT=0
       if ! command -v xcaddy >/dev/null 2>&1; then
         info "安装 xcaddy"
+        XCADDY_INSTALLED_BY_SCRIPT=1
         if ! go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest; then
           error "xcaddy 安装失败。若网络受限，可先执行 export GOPROXY=https://goproxy.cn,direct 后重试"
         fi
@@ -895,6 +907,27 @@ do_install() {
       fi
       CADDY_BIN=/usr/local/bin/caddy
       [[ ! -x "$CADDY_BIN" ]] && error "Caddy 构建产物缺失"
+
+      # ---------- 清理编译工具链 ----------
+      # Caddy 二进制为静态编译，运行不依赖 Go；Go/xcaddy/缓存仅编译时需要，用完即删。
+      # 仅删除本脚本安装的部分，避免误删用户原有环境。
+      step "清理编译工具（Go / xcaddy / 构建缓存）"
+      local _GOPATH _GOCACHE
+      _GOPATH="$(go env GOPATH 2>/dev/null || echo '')"
+      _GOCACHE="$(go env GOCACHE 2>/dev/null || echo '')"
+      if [[ "$XCADDY_INSTALLED_BY_SCRIPT" == "1" ]]; then
+        rm -f "${_GOPATH}/bin/xcaddy" 2>/dev/null || true
+      fi
+      if [[ "$GO_INSTALLED_BY_SCRIPT" == "1" ]]; then
+        rm -rf /usr/local/go
+        [[ -n "${_GOPATH}" && "${_GOPATH}" != "$HOME" ]] && rm -rf "${_GOPATH}"
+        [[ -n "${_GOCACHE}" ]] && rm -rf "${_GOCACHE}"
+        hash -r 2>/dev/null || true
+        info "已删除 Go 工具链、xcaddy 及构建缓存"
+      else
+        info "检测到 Go 为系统原有环境，保留不动"
+      fi
+      info "清理完成，仅保留编译好的 Caddy 二进制（$CADDY_BIN）"
     else
       # HTTP-01 使用官方 apt 包即可
       if ! command -v caddy >/dev/null 2>&1; then
@@ -1302,8 +1335,13 @@ do_uninstall() {
     rm -rf /etc/caddy /var/lib/caddy
 
     rm -f /usr/local/bin/caddy
+    # 清理 Go/xcaddy 编译残留（新版脚本装完即删，此处兜底清理旧版残留）
+    rm -rf /root/.cache/go-build 2>/dev/null || true
     if command -v go >/dev/null 2>&1; then
       rm -f "$(go env GOPATH)/bin/xcaddy" 2>/dev/null || true
+    else
+      rm -rf /root/go 2>/dev/null || true
+      rm -rf /usr/local/go 2>/dev/null || true
     fi
     info "Caddy 相关文件已清理"
   fi
