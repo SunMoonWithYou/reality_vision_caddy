@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="banner.png" width="100%" alt="vnStat 流量统计 & Telegram 日报管理工具">
+</p>
+
 # Xray Reality + Vision 一键管理脚本
 
 一键部署和管理 **Xray + REALITY + Vision (xtls-rprx-vision)** 的 Bash 脚本。
