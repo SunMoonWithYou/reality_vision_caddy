@@ -18,6 +18,13 @@
 #   4. 客户端参数 : 输出指定用户的 VLESS 分享链接与详细参数
 #   5. 用户管理   : 列出 / 添加 / 删除用户，实时重建 Xray 配置并重启
 #   6. 诊断自检   : 连不上时优先使用，只读检查，不修改任何配置
+#   7. 流量统计   : 按月查看每个用户的长期累计流量（详细历史保留 1 年）
+#                  支持每小时自动累计（systemd timer）
+#   8. TG 日报    : 配置 Telegram Bot，每天 01:00 自动推送昨日流量日报
+# ----------------------------------------------------------------------------
+# 非交互模式:
+#   ./脚本 --accumulate   供流量累计定时任务调用
+#   ./脚本 --tg-report    供 Telegram 日报定时任务调用
 # ============================================================================
 
 set -euo pipefail   # 开启严格模式：遇错退出、未定义变量报错、管道失败即失败
@@ -99,10 +106,28 @@ fi
 # ----------------------------------------------------------------------------
 USERS_FILE=/etc/reality-caddy/users.txt          # 用户列表文件 (uuid|email|note)
 INFO_FILE=/etc/reality-caddy/info.txt            # 安装信息持久化文件
+TRAFFIC_FILE=/etc/reality-caddy/traffic.json     # 长期流量累计文件
+TG_CONF=/etc/reality-caddy/telegram.conf         # Telegram 配置文件
 XRAY_CONF=/usr/local/etc/xray/config.json        # Xray 主配置文件路径
 LOG_RETENTION_DAYS=7                             # 日志保留天数
 CADDY_BIN=""                                     # Caddy 可执行文件路径（安装后赋值）
 ACME_CHALLENGE=""                                # 证书验证方式：http 或 dns
+
+# ----------------------------------------------------------------------------
+# 支持非交互模式
+#   ./脚本 --accumulate     供流量累计 timer 调用
+#   ./脚本 --tg-report      供 Telegram 日报 timer 调用
+# ----------------------------------------------------------------------------
+if [[ "${1:-}" == "--accumulate" ]]; then
+  ACCUMULATE_MODE=1
+  TG_REPORT_MODE=0
+elif [[ "${1:-}" == "--tg-report" ]]; then
+  ACCUMULATE_MODE=0
+  TG_REPORT_MODE=1
+else
+  ACCUMULATE_MODE=0
+  TG_REPORT_MODE=0
+fi
 
 # IP 模式下内置候选伪装目标（真实大型网站，支持 TLS1.3）
 BUILTIN_DESTS=(
@@ -131,12 +156,14 @@ show_menu() {
   mi 4 "查看参数" "输出客户端分享链接与详细配置"
   mi 5 "管理用户" "添加 / 删除 / 查看用户"
   mi 6 "诊断自检" "连不上时优先使用（只读）"
+  mi 7 "流量统计" "按月查看用户累计流量"
+  mi 8 "TG 日报" "配置 / 测试 Telegram 每日流量推送"
   line
   mi 0 "退出脚本" "安全退出"
   echo
   echo -e "  ${YELLOW}提示：连接异常时请先执行 [6] 诊断自检${NC}"
   echo
-  read -rp "  请选择 [0-6]: " CHOICE
+  read -rp "  请选择 [0-8]: " CHOICE
 }
 
 # ============================================================================
@@ -181,6 +208,7 @@ build_clients_json() {
     printf '          {\n'
     printf '            "id": "%s",\n' "$uuid"
     printf '            "email": "%s",\n' "${email:-user@local}"
+    printf '            "level": 0,\n'
     printf '            "flow": "xtls-rprx-vision"\n'
     printf '          }'
   done < "$USERS_FILE"
@@ -228,17 +256,32 @@ rebuild_xray_config() {
     REALITY_SNI="${DOMAIN}"
   fi
 
-  # 写入完整 Xray 配置
+  # 写入完整 Xray 配置（已启用用户流量统计）
   cat > "$XRAY_CONF" <<EOF
 {
   "log": {
     "loglevel": "warning"
+  },
+  "stats": {},
+  "api": {
+    "tag": "api",
+    "listen": "127.0.0.1:10085",
+    "services": ["StatsService"]
+  },
+  "policy": {
+    "levels": {
+      "0": {
+        "statsUserUplink": true,
+        "statsUserDownlink": true
+      }
+    }
   },
   "inbounds": [
     {
       "listen": "0.0.0.0",
       "port": ${XRAY_PORT},
       "protocol": "vless",
+      "tag": "vless-in",
       "settings": {
         "clients": ${CLIENTS_JSON},
         "decryption": "none"
@@ -1291,6 +1334,9 @@ EOF
 
   print_port_notice "$MODE" "$XRAY_PORT"
 
+  # 启用自动流量累计定时任务
+  setup_traffic_timer
+
   info "安装完成！"
   read -rp "  按回车返回主菜单..." _
 }
@@ -1359,6 +1405,20 @@ do_uninstall() {
     read -rp "删除伪装站 /var/www/html ? [y/N]: " DEL
     [[ "${DEL,,}" == "y" ]] && rm -rf /var/www/html && info "已删除"
   fi
+
+  # 清理流量定时任务
+  systemctl disable --now xray-traffic-accumulate.timer 2>/dev/null || true
+  systemctl disable --now xray-traffic-accumulate.service 2>/dev/null || true
+  rm -f /etc/systemd/system/xray-traffic-accumulate.service \
+        /etc/systemd/system/xray-traffic-accumulate.timer
+
+  # 清理 Telegram 日报定时任务
+  systemctl disable --now xray-tg-report.timer 2>/dev/null || true
+  systemctl disable --now xray-tg-report.service 2>/dev/null || true
+  rm -f /etc/systemd/system/xray-tg-report.service \
+        /etc/systemd/system/xray-tg-report.timer
+
+  systemctl daemon-reload 2>/dev/null || true
 
   echo
   if [[ "$MODE" == "ip" ]]; then
@@ -1799,8 +1859,710 @@ do_diagnose() {
 }
 
 # ============================================================================
+# 七、用户流量统计（长期累计）
+# ============================================================================
+# ============================================================================
+# 流量统计菜单
+# 先调用累计函数把内存中的增量写入文件，再按月聚合显示，并显示总累计
+# 显示时优先使用 users.txt 中的备注字段
+# ============================================================================
+do_traffic() {
+  clear
+  banner "用户流量统计（按月）"
+  if ! is_installed; then
+    warn "尚未安装"
+    read -rp "  按回车返回..." _
+    return
+  fi
+
+  load_kv "$INFO_FILE" 2>/dev/null || true
+
+  # 检查是否已启用统计
+  if ! grep -q '"stats"' "$XRAY_CONF" 2>/dev/null; then
+    warn "当前 Xray 配置未启用流量统计"
+    echo
+    read -rp "  是否现在重建配置并重启 Xray 以启用？[y/N]: " C
+    if [[ "${C,,}" == "y" ]]; then
+      if rebuild_xray_config; then
+        systemctl restart xray
+        info "配置已重建，Xray 已重启。请等待几秒后重新查看流量。"
+      else
+        warn "配置重建失败"
+      fi
+    fi
+    read -rp "  按回车返回..." _
+    return
+  fi
+
+  if ! systemctl is-active --quiet xray; then
+    warn "xray 服务未运行"
+    read -rp "  按回车返回..." _
+    return
+  fi
+
+  local API_ADDR="127.0.0.1:10085"
+  info "正在查询并累计流量数据..."
+
+  # 先执行一次累计（带 reset）
+  accumulate_traffic_silent || warn "本次累计可能失败，将显示上次保存的数据"
+
+  echo
+  echo -e "  ${BOLD}用户流量统计（按月汇总，详细历史保留 1 年）${NC}"
+  line
+
+  if command -v python3 >/dev/null 2>&1 && [[ -f "$TRAFFIC_FILE" ]]; then
+    python3 - "$TRAFFIC_FILE" "$USERS_FILE" <<'PY'
+import json, sys, os
+from collections import defaultdict
+
+traffic_file = sys.argv[1]
+users_file = sys.argv[2]
+
+try:
+    with open(traffic_file) as f:
+        store = json.load(f)
+except Exception:
+    print("  读取数据文件失败")
+    sys.exit(0)
+
+cumulative = store.get("cumulative", {})
+daily = store.get("daily", [])
+meta = store.get("_meta", {})
+
+known = []
+email_to_note = {}
+if os.path.isfile(users_file):
+    with open(users_file) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split("|")
+            if len(parts) >= 2:
+                email = parts[1]
+                note = parts[2] if len(parts) >= 3 else ""
+                known.append(email)
+                email_to_note[email] = note.strip() if note.strip() else email
+
+def display_name(email):
+    return email_to_note.get(email, email)
+
+def fmt(b):
+    b = int(b or 0)
+    if b < 1024:
+        return f"{b} B"
+    elif b < 1024**2:
+        return f"{b/1024:.1f} KB"
+    elif b < 1024**3:
+        return f"{b/1024**2:.1f} MB"
+    else:
+        return f"{b/1024**3:.2f} GB"
+
+# ---------- 按月聚合 ----------
+# month -> email -> {up, down}
+monthly = defaultdict(lambda: defaultdict(lambda: {"uplink": 0, "downlink": 0}))
+for rec in daily:
+    date = rec.get("date", "")
+    if len(date) < 7:
+        continue
+    month = date[:7]  # YYYY-MM
+    for email, d in rec.get("users", {}).items():
+        monthly[month][email]["uplink"] += d.get("uplink", 0)
+        monthly[month][email]["downlink"] += d.get("downlink", 0)
+
+months = sorted(monthly.keys(), reverse=True)
+
+def display_width(s):
+    """计算字符串在终端的显示宽度（中文算 2）"""
+    w = 0
+    for c in str(s):
+        w += 2 if ord(c) > 127 else 1
+    return w
+
+def pad(s, width, align="left"):
+    s = str(s)
+    dw = display_width(s)
+    pad_len = max(0, width - dw)
+    if align == "right":
+        return " " * pad_len + s
+    return s + " " * pad_len
+
+# 固定列宽
+COL_NAME = 20
+COL_NUM = 12
+
+print("  【按月统计】")
+print()
+if not months:
+    print("  暂无月度数据")
+else:
+    for month in months:
+        print(f"  ── {month} ──")
+        header = f"    {pad('备注', COL_NAME)} {pad('上行', COL_NUM, 'right')} {pad('下行', COL_NUM, 'right')} {pad('总计', COL_NUM, 'right')}"
+        print(header)
+        m_up = m_down = 0
+        # 只显示有流量的用户，按总流量从高到低排序
+        users_in_month = [e for e in monthly[month].keys()
+                          if monthly[month][e]["uplink"] + monthly[month][e]["downlink"] > 0]
+        users_in_month.sort(key=lambda e: -(monthly[month][e]["uplink"] + monthly[month][e]["downlink"]))
+        for e in users_in_month:
+            up = monthly[month][e]["uplink"]
+            down = monthly[month][e]["downlink"]
+            total = up + down
+            m_up += up
+            m_down += down
+            name = display_name(e)
+            print(f"    {pad(name, COL_NAME)} {pad(fmt(up), COL_NUM, 'right')} {pad(fmt(down), COL_NUM, 'right')} {pad(fmt(total), COL_NUM, 'right')}")
+        if users_in_month:
+            print("    " + "─" * (COL_NAME + COL_NUM * 3 + 3))
+            print(f"    {pad('本月合计', COL_NAME)} {pad(fmt(m_up), COL_NUM, 'right')} {pad(fmt(m_down), COL_NUM, 'right')} {pad(fmt(m_up + m_down), COL_NUM, 'right')}")
+        else:
+            print("    本月无流量")
+        print()
+
+# ---------- 总累计 ----------
+print("  【总累计（自安装以来）】")
+print()
+active_emails = [e for e in set(list(cumulative.keys()) + known)
+                 if cumulative.get(e, {}).get("uplink", 0) + cumulative.get(e, {}).get("downlink", 0) > 0]
+active_emails.sort(key=lambda e: -(cumulative.get(e, {}).get("uplink", 0) + cumulative.get(e, {}).get("downlink", 0)))
+print(f"  {pad('备注', COL_NAME)} {pad('上行', COL_NUM, 'right')} {pad('下行', COL_NUM, 'right')} {pad('总计', COL_NUM, 'right')}")
+print("  " + "─" * (COL_NAME + COL_NUM * 3 + 3))
+total_up = total_down = 0
+for e in active_emails:
+    up = cumulative.get(e, {}).get("uplink", 0)
+    down = cumulative.get(e, {}).get("downlink", 0)
+    total = up + down
+    total_up += up
+    total_down += down
+    name = display_name(e)
+    print(f"  {pad(name, COL_NAME)} {pad(fmt(up), COL_NUM, 'right')} {pad(fmt(down), COL_NUM, 'right')} {pad(fmt(total), COL_NUM, 'right')}")
+if not active_emails:
+    print("  暂无流量数据")
+print("  " + "─" * (COL_NAME + COL_NUM * 3 + 3))
+print(f"  {pad('总计', COL_NAME)} {pad(fmt(total_up), COL_NUM, 'right')} {pad(fmt(total_down), COL_NUM, 'right')} {pad(fmt(total_up+total_down), COL_NUM, 'right')}")
+
+print()
+print(f"  详细日数据保留: {len(daily)} 天")
+if meta.get("last_update_str"):
+    print(f"  最后更新: {meta['last_update_str']}")
+print("  历史详细记录保留 1 年，过期自动清理")
+PY
+  else
+    warn "未找到 python3 或数据文件"
+  fi
+
+  echo
+  echo -e "  ${DIM}数据文件: ${TRAFFIC_FILE}${NC}"
+  echo -e "  ${DIM}已启用每小时自动累计（systemd timer）${NC}"
+  echo
+  read -rp "  按回车返回主菜单..." _
+}
+
+# ============================================================================
+# 静默累计流量（供定时任务和菜单调用）
+# ----------------------------------------------------------------------------
+# 工作流程:
+#   1. 调用 xray api statsquery（不带 reset）获取当前内存中的流量
+#   2. 解析 JSON，提取 user>>>email>>>traffic>>>uplink/downlink
+#      注意：名称用 >>> 分割后只有 4 段，email 在 parts[1]，方向在 parts[3]
+#   3. 累加到 /etc/reality-caddy/traffic.json 的 cumulative 和 daily
+#   4. 成功后再执行一次带 -reset=true 的查询，清空 Xray 内存计数器
+#   5. daily 数组只保留最近 365 天的记录
+# ============================================================================
+accumulate_traffic_silent() {
+  [[ ! -f "$INFO_FILE" ]] && return 1
+  [[ ! -x /usr/local/bin/xray ]] && return 1
+  systemctl is-active --quiet xray || return 1
+
+  local API_ADDR="127.0.0.1:10085"
+  local TMPRAW TMPOUT
+  TMPRAW=$(mktemp)
+  TMPOUT=$(mktemp)
+
+  # 不带 reset 查询
+  timeout 15 xray api statsquery --server="$API_ADDR" >"$TMPRAW" 2>/dev/null || true
+  if [[ ! -s "$TMPRAW" ]]; then
+    rm -f "$TMPRAW" "$TMPOUT"
+    return 1
+  fi
+
+  # 用 Python 处理
+  python3 - "$TMPRAW" "$TRAFFIC_FILE" >"$TMPOUT" 2>&1 <<'PY'
+import json, sys, os, time
+from datetime import datetime, timedelta
+
+raw_file = sys.argv[1]
+traffic_file = sys.argv[2]
+
+try:
+    with open(raw_file, encoding="utf-8") as f:
+        content = f.read().strip()
+    if not content.startswith("{"):
+        idx = content.find("{")
+        if idx >= 0:
+            content = content[idx:]
+    data = json.loads(content)
+except Exception as e:
+    print(f"PARSE_ERROR:{e}", file=sys.stderr)
+    sys.exit(1)
+
+delta = {}
+for item in data.get("stat", []):
+    name = item.get("name", "")
+    try:
+        value = int(item.get("value", 0))
+    except Exception:
+        value = 0
+    if name.startswith("user>>>") and ">>>traffic>>>" in name:
+        parts = name.split(">>>")
+        if len(parts) >= 4:
+            email = parts[1]
+            direction = parts[3]
+            delta.setdefault(email, {"uplink": 0, "downlink": 0})
+            delta[email][direction] = value
+
+print(f"DELTA_COUNT:{len(delta)}", file=sys.stderr)
+
+store = {"cumulative": {}, "daily": [], "_meta": {}}
+if os.path.isfile(traffic_file):
+    try:
+        with open(traffic_file) as f:
+            store = json.load(f)
+    except Exception:
+        pass
+
+store.setdefault("cumulative", {})
+store.setdefault("daily", [])
+
+today = datetime.now().strftime("%Y-%m-%d")
+
+for email, d in delta.items():
+    if email not in store["cumulative"]:
+        store["cumulative"][email] = {"uplink": 0, "downlink": 0}
+    store["cumulative"][email]["uplink"] += d.get("uplink", 0)
+    store["cumulative"][email]["downlink"] += d.get("downlink", 0)
+
+found = False
+for rec in store["daily"]:
+    if rec.get("date") == today:
+        for email, d in delta.items():
+            if email not in rec.setdefault("users", {}):
+                rec["users"][email] = {"uplink": 0, "downlink": 0}
+            rec["users"][email]["uplink"] += d.get("uplink", 0)
+            rec["users"][email]["downlink"] += d.get("downlink", 0)
+        found = True
+        break
+if not found and delta:
+    store["daily"].append({
+        "date": today,
+        "users": {e: dict(d) for e, d in delta.items()}
+    })
+
+cutoff = (datetime.now() - timedelta(days=365)).strftime("%Y-%m-%d")
+store["daily"] = [r for r in store["daily"] if r.get("date", "9999") >= cutoff]
+
+store["_meta"] = {
+    "last_update": int(time.time()),
+    "last_update_str": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    "retention_days": 365
+}
+
+try:
+    os.makedirs(os.path.dirname(traffic_file), exist_ok=True)
+    with open(traffic_file, "w") as f:
+        json.dump(store, f, indent=2, ensure_ascii=False)
+    os.chmod(traffic_file, 0o600)
+    print("OK", file=sys.stderr)
+except Exception as e:
+    print(f"WRITE_ERROR:{e}", file=sys.stderr)
+    sys.exit(1)
+PY
+
+  # 查询成功后再 reset
+  if grep -q "OK" "$TMPOUT" 2>/dev/null; then
+    timeout 10 xray api statsquery --server="$API_ADDR" -reset=true >/dev/null 2>&1 || true
+  fi
+
+  rm -f "$TMPRAW" "$TMPOUT"
+}
+
+# ============================================================================
+# 安装每小时流量累计定时任务
+# 创建 systemd service + timer，每小时调用本脚本 --accumulate
+# ============================================================================
+setup_traffic_timer() {
+  local SCRIPT_PATH
+  SCRIPT_PATH=$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")
+
+  cat > /etc/systemd/system/xray-traffic-accumulate.service <<EOF
+[Unit]
+Description=Xray Reality Traffic Accumulate
+After=xray.service
+
+[Service]
+Type=oneshot
+ExecStart=${SCRIPT_PATH} --accumulate
+User=root
+EOF
+
+  cat > /etc/systemd/system/xray-traffic-accumulate.timer <<EOF
+[Unit]
+Description=Hourly Xray Traffic Accumulate
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=1h
+AccuracySec=1min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  systemctl daemon-reload
+  systemctl enable --now xray-traffic-accumulate.timer >/dev/null 2>&1 || true
+  info "已启用每小时自动累计流量定时任务"
+}
+
+# ============================================================================
+# Telegram 日报相关
+# ============================================================================
+load_tg_conf() {
+  TG_BOT_TOKEN=""
+  TG_CHAT_ID=""
+  [[ -f "$TG_CONF" ]] || return 1
+  while IFS='=' read -r k v; do
+    [[ -z "$k" || "$k" =~ ^# ]] && continue
+    v=${v%\"}; v=${v#\"}
+    case "$k" in
+      BOT_TOKEN) TG_BOT_TOKEN="$v" ;;
+      CHAT_ID)   TG_CHAT_ID="$v" ;;
+    esac
+  done < "$TG_CONF"
+  [[ -n "$TG_BOT_TOKEN" && -n "$TG_CHAT_ID" ]]
+}
+
+save_tg_conf() {
+  mkdir -p "$(dirname "$TG_CONF")"
+  cat > "$TG_CONF" <<EOF
+BOT_TOKEN="${TG_BOT_TOKEN}"
+CHAT_ID="${TG_CHAT_ID}"
+EOF
+  chmod 600 "$TG_CONF"
+}
+
+send_tg_message() {
+  local text="$1"
+  load_tg_conf || return 1
+  curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+    -d "chat_id=${TG_CHAT_ID}" \
+    --data-urlencode "text=${text}" \
+    -d "parse_mode=HTML" \
+    -d "disable_web_page_preview=true" \
+    >/dev/null 2>&1
+}
+
+# ============================================================================
+# 生成 Telegram 昨日流量日报文本
+# 从 traffic.json 的 daily 数组中取出昨天的记录，按用户汇总后格式化成 HTML
+# ============================================================================
+generate_tg_report() {
+  # 先累计一次
+  accumulate_traffic_silent >/dev/null 2>&1 || true
+
+  [[ -f "$TRAFFIC_FILE" ]] || return 1
+
+  # 获取服务器 IP（优先用已保存的，否则实时检测）
+  local SRV_IP=""
+  load_kv "$INFO_FILE" 2>/dev/null || true
+  SRV_IP="${SERVER_IP:-}"
+  [[ -z "$SRV_IP" ]] && SRV_IP=$(get_public_ip 2>/dev/null || echo "未知")
+
+  python3 - "$TRAFFIC_FILE" "$SRV_IP" "$USERS_FILE" <<'PY'
+import json, sys, os
+from datetime import datetime, timedelta
+from collections import defaultdict
+
+try:
+    with open(sys.argv[1]) as f:
+        store = json.load(f)
+except Exception:
+    sys.exit(1)
+
+srv_ip = sys.argv[2] if len(sys.argv) > 2 else "未知"
+users_file = sys.argv[3] if len(sys.argv) > 3 else ""
+
+# email -> note
+email_to_note = {}
+if users_file and os.path.isfile(users_file):
+    with open(users_file) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split("|")
+            if len(parts) >= 2:
+                email = parts[1]
+                note = parts[2].strip() if len(parts) >= 3 else ""
+                email_to_note[email] = note if note else email
+
+def display_name(email):
+    return email_to_note.get(email, email)
+
+daily = store.get("daily", [])
+yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+
+# 聚合昨日
+y_users = defaultdict(lambda: {"uplink": 0, "downlink": 0})
+for rec in daily:
+    if rec.get("date") == yesterday:
+        for email, d in rec.get("users", {}).items():
+            y_users[email]["uplink"] += d.get("uplink", 0)
+            y_users[email]["downlink"] += d.get("downlink", 0)
+
+def fmt(b):
+    b = int(b or 0)
+    if b < 1024: return f"{b} B"
+    if b < 1024**2: return f"{b/1024:.1f} KB"
+    if b < 1024**3: return f"{b/1024**2:.1f} MB"
+    return f"{b/1024**3:.2f} GB"
+
+lines = [
+    "📊 <b>Xray Reality 流量日报</b>",
+    f"📅 日期：<code>{yesterday}</code>",
+    f"🖥 服务器：<code>{srv_ip}</code>",
+    ""
+]
+
+if not y_users:
+    lines.append("😴 昨日无流量记录")
+else:
+    total_up = total_down = 0
+    # 按总流量从高到低排序
+    sorted_emails = sorted(y_users.keys(), key=lambda e: -(y_users[e]["uplink"] + y_users[e]["downlink"]))
+    for email in sorted_emails:
+        up = y_users[email]["uplink"]
+        down = y_users[email]["downlink"]
+        total_up += up
+        total_down += down
+        lines.append(f"👤 <b>{display_name(email)}</b>")
+        lines.append(f"   ⬆️ 上行  <code>{fmt(up)}</code>")
+        lines.append(f"   ⬇️ 下行  <code>{fmt(down)}</code>")
+        lines.append("")
+    lines.append(f"📈 <b>合计</b>")
+    lines.append(f"   ⬆️ 上行  <code>{fmt(total_up)}</code>")
+    lines.append(f"   ⬇️ 下行  <code>{fmt(total_down)}</code>")
+    lines.append(f"   📦 总计  <code>{fmt(total_up + total_down)}</code>")
+
+lines.append("")
+lines.append(f"⏰ 生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+print("\n".join(lines))
+PY
+}
+
+# ============================================================================
+# Telegram 日报配置菜单
+# 支持：配置 Token/ChatID、测试发送、手动发送昨日日报、启用/关闭每天 01:00 定时推送
+# ============================================================================
+do_telegram() {
+  clear
+  banner "Telegram 日报设置"
+  if ! is_installed; then
+    warn "尚未安装"
+    read -rp "  按回车返回..." _
+    return
+  fi
+
+  load_tg_conf 2>/dev/null || true
+
+  echo
+  echo -e "  ${BOLD}当前配置${NC}"
+  line
+  if [[ -n "${TG_BOT_TOKEN:-}" ]]; then
+    echo -e "  Bot Token : ${TG_BOT_TOKEN:0:10}...（已设置）"
+    echo -e "  Chat ID   : ${TG_CHAT_ID:-未设置}"
+  else
+    echo -e "  ${YELLOW}尚未配置${NC}"
+  fi
+  line
+  echo
+  mi 1 "配置 Token" "设置 Bot Token 和 Chat ID"
+  mi 2 "测试发送" "立即发送一条测试消息"
+  mi 3 "手动日报" "立即生成并发送昨日日报"
+  mi 4 "启用定时" "每天 01:00 自动发送昨日日报"
+  mi 5 "关闭定时" "停止自动日报"
+  line
+  mi 0 "返回" "返回主菜单"
+  echo
+  read -rp "  请选择 [0-5]: " TC
+  case "$TC" in
+    1)
+      echo
+      read -rp "  Bot Token: " TG_BOT_TOKEN
+      read -rp "  Chat ID  : " TG_CHAT_ID
+      [[ -z "$TG_BOT_TOKEN" || -z "$TG_CHAT_ID" ]] && { warn "不能为空"; return; }
+      save_tg_conf
+      info "已保存"
+      ;;
+    2)
+      if send_tg_message "✅ Reality 脚本测试消息 $(date '+%Y-%m-%d %H:%M:%S')"; then
+        info "测试消息已发送"
+      else
+        warn "发送失败，请检查 Token / Chat ID / 网络"
+      fi
+      ;;
+    3)
+      local report
+      report=$(generate_tg_report)
+      if [[ -n "$report" ]] && send_tg_message "$report"; then
+        info "日报已发送"
+      else
+        warn "生成或发送失败"
+      fi
+      ;;
+    4)
+      setup_tg_timer
+      ;;
+    5)
+      systemctl disable --now xray-tg-report.timer 2>/dev/null || true
+      info "已关闭自动日报"
+      ;;
+  esac
+  echo
+  read -rp "  按回车返回..." _
+}
+
+# ============================================================================
+# 安装每天 01:00 Telegram 日报定时任务
+# 创建 systemd service + timer，每天凌晨 1 点调用本脚本 --tg-report
+# ============================================================================
+setup_tg_timer() {
+  local SCRIPT_PATH
+  SCRIPT_PATH=$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")
+
+  cat > /etc/systemd/system/xray-tg-report.service <<EOF
+[Unit]
+Description=Xray Reality Telegram Daily Report
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=${SCRIPT_PATH} --tg-report
+User=root
+EOF
+
+  cat > /etc/systemd/system/xray-tg-report.timer <<EOF
+[Unit]
+Description=Daily Telegram Traffic Report at 01:00
+
+[Timer]
+OnCalendar=*-*-* 01:00:00
+Persistent=true
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  systemctl daemon-reload
+  systemctl enable --now xray-tg-report.timer >/dev/null 2>&1 || true
+  info "已启用每天 01:00 自动发送 Telegram 日报"
+}
+
+# ============================================================================
+# 自动检测并补全定时任务（无需重装）
+# ============================================================================
+auto_setup_timers() {
+  [[ ! -f "$INFO_FILE" ]] && return 0
+
+  local SCRIPT_PATH
+  SCRIPT_PATH=$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")
+
+  local need_reload=0
+
+  # 流量累计 timer
+  if ! systemctl list-unit-files 2>/dev/null | grep -q '^xray-traffic-accumulate.timer'; then
+    cat > /etc/systemd/system/xray-traffic-accumulate.service <<EOF
+[Unit]
+Description=Xray Reality Traffic Accumulate
+After=xray.service
+
+[Service]
+Type=oneshot
+ExecStart=${SCRIPT_PATH} --accumulate
+User=root
+EOF
+    cat > /etc/systemd/system/xray-traffic-accumulate.timer <<EOF
+[Unit]
+Description=Hourly Xray Traffic Accumulate
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+    need_reload=1
+    info "已自动创建流量累计定时任务（每小时）"
+  fi
+
+  # TG 日报 timer（仅当已配置 Token 时才自动启用）
+  if load_tg_conf 2>/dev/null && ! systemctl list-unit-files 2>/dev/null | grep -q '^xray-tg-report.timer'; then
+    cat > /etc/systemd/system/xray-tg-report.service <<EOF
+[Unit]
+Description=Xray Reality Telegram Daily Report
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=${SCRIPT_PATH} --tg-report
+User=root
+EOF
+    cat > /etc/systemd/system/xray-tg-report.timer <<EOF
+[Unit]
+Description=Daily Telegram Traffic Report at 01:00
+
+[Timer]
+OnCalendar=*-*-* 01:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+    need_reload=1
+    info "已自动创建 TG 日报定时任务（每天 01:00）"
+  fi
+
+  if [[ $need_reload -eq 1 ]]; then
+    systemctl daemon-reload
+    systemctl enable --now xray-traffic-accumulate.timer >/dev/null 2>&1 || true
+    if systemctl list-unit-files 2>/dev/null | grep -q '^xray-tg-report.timer'; then
+      systemctl enable --now xray-tg-report.timer >/dev/null 2>&1 || true
+    fi
+  fi
+}
+
+# ============================================================================
 # 主循环
 # ============================================================================
+# 非交互模式
+if [[ "$ACCUMULATE_MODE" == "1" ]]; then
+  accumulate_traffic_silent
+  exit $?
+fi
+
+if [[ "$TG_REPORT_MODE" == "1" ]]; then
+  report=$(generate_tg_report)
+  if [[ -n "$report" ]]; then
+    send_tg_message "$report" && exit 0
+  fi
+  exit 1
+fi
+
 while true; do
   show_menu
   case "$CHOICE" in
@@ -1810,6 +2572,8 @@ while true; do
     4) do_show_client ;;
     5) users_menu ;;
     6) do_diagnose ;;
+    7) do_traffic ;;
+    8) do_telegram ;;
     0) info "再见！"; exit 0 ;;
     *) warn "无效选择"; sleep 1 ;;
   esac
