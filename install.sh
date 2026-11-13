@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
 # ============================================================================
-# Xray Reality + Vision 一键管理脚本
+# Xray Reality + Vision / XHTTP 一键管理脚本
 # ----------------------------------------------------------------------------
-# 项目名称 : Xray Reality + Vision 一键管理脚本
+# 项目名称 : Xray Reality + Vision / XHTTP 一键管理脚本
 # 支持系统 : Debian 11/12/13、Ubuntu 20.04/22.04/24.04
 # 运行权限 : 必须以 root 用户执行
 # ----------------------------------------------------------------------------
 # 功能概览:
 #   1. 安装服务
-#      - 域名模式 : Xray (Reality + Vision) + Caddy 本地伪装站 + 自动申请证书
+#      - 域名模式 : Xray (Reality + Vision 或 XHTTP) + Caddy 本地伪装站 + 自动申请证书
 #                  默认监听 443；支持 HTTP-01 或 DNS-01 (Cloudflare)
 #                  HTTP-01 会占用 80 端口；DNS-01 不占用 80，完全不影响现有 Web 服务
-#      - IP 模式  : 仅安装 Xray (Reality + Vision)，无需域名、无需 Caddy
+#      - IP 模式  : 仅安装 Xray (Reality + Vision 或 XHTTP)，无需域名、无需 Caddy
 #                  默认监听 8443，需选择一个支持 TLS1.3 的真实网站作为伪装目标
 #   2. 卸载服务   : 停止服务、删除配置，可选清理安装信息与伪装站
 #   3. 查看状态   : 服务运行状态、端口监听、版本信息
@@ -59,19 +59,19 @@ step() {
 
 # 大标题横幅：双线框，内容居中对齐
 banner() {
+  local t="$*"
   echo -e "${CYAN}"
-  echo -e "  ╔═════════════════════════════════════════════════╗"
-  echo -e "  ║                                                 ║"
-  printf  "  ║   %-45s ║\n" "$*"
-  echo -e "  ║                                                 ║"
-  echo -e "  ╚═════════════════════════════════════════════════╝"
+  echo "  ================================================"
+  echo "  $t"
+  echo "  ================================================"
   echo -e "${NC}"
 }
 
 # 菜单项输出：编号高亮 + 名称左对齐 + 说明暗色
 # 用法: mi <编号> <名称> <说明>
 mi() {
-  printf "  ${GREEN}[%s]${NC}  %-14s  ${DIM}%s${NC}\n" "$1" "$2" "$3"
+  printf "  ${GREEN}[%s]${NC}  %s\n" "$1" "$2"
+  printf "      ${DIM}%s${NC}\n" "$3"
 }
 
 # 统一分隔线
@@ -146,10 +146,10 @@ BUILTIN_DESTS=(
 # ============================================================================
 show_menu() {
   clear
-  banner "Xray Reality + Vision  一键管理脚本"
+  banner "Xray Reality + Vision / XHTTP"
   echo
   echo -e "  ${BOLD}功能菜单${NC}"
-  line
+  echo
   mi 1 "安装服务" "域名模式 / IP模式 一键部署"
   mi 2 "卸载服务" "停止并清理全部组件"
   mi 3 "查看状态" "服务运行状态与端口监听"
@@ -158,7 +158,7 @@ show_menu() {
   mi 6 "诊断自检" "连不上时优先使用（只读）"
   mi 7 "流量统计" "按月查看用户累计流量"
   mi 8 "TG 日报" "配置 / 测试 Telegram 每日流量推送"
-  line
+  echo
   mi 0 "退出脚本" "安全退出"
   echo
   echo -e "  ${YELLOW}提示：连接异常时请先执行 [6] 诊断自检${NC}"
@@ -200,6 +200,8 @@ load_kv() {
 build_clients_json() {
   [[ ! -f "$USERS_FILE" ]] && { echo '[]'; return; }
   local first=1
+  local use_flow=0
+  [[ "${TRANSPORT:-tcp}" == "tcp" ]] && use_flow=1
   echo "["
   while IFS='|' read -r uuid email note; do
     [[ -z "$uuid" || "$uuid" =~ ^# ]] && continue
@@ -208,8 +210,12 @@ build_clients_json() {
     printf '          {\n'
     printf '            "id": "%s",\n' "$uuid"
     printf '            "email": "%s",\n' "${email:-user@local}"
-    printf '            "level": 0,\n'
-    printf '            "flow": "xtls-rprx-vision"\n'
+    printf '            "level": 0'
+    if [[ $use_flow -eq 1 ]]; then
+      printf ',\n            "flow": "xtls-rprx-vision"\n'
+    else
+      printf '\n'
+    fi
     printf '          }'
   done < "$USERS_FILE"
   echo
@@ -257,6 +263,51 @@ rebuild_xray_config() {
   fi
 
   # 写入完整 Xray 配置（已启用用户流量统计）
+  local STREAM_SETTINGS
+  if [[ "${TRANSPORT:-tcp}" == "xhttp" ]]; then
+    STREAM_SETTINGS=$(cat <<EOS
+        "network": "xhttp",
+        "security": "reality",
+        "realitySettings": {
+          "show": false,
+          "dest": "${REALITY_DEST}",
+          "xver": 0,
+          "serverNames": [
+            "${REALITY_SNI}"
+          ],
+          "privateKey": "${PRIVATE_KEY}",
+          "shortIds": [
+            "",
+            "${SHORT_ID}"
+          ]
+        },
+        "xhttpSettings": {
+          "path": "${XHTTP_PATH:-/xhttp}",
+          "mode": "auto"
+        }
+EOS
+)
+  else
+    STREAM_SETTINGS=$(cat <<EOS
+        "network": "tcp",
+        "security": "reality",
+        "realitySettings": {
+          "show": false,
+          "dest": "${REALITY_DEST}",
+          "xver": 0,
+          "serverNames": [
+            "${REALITY_SNI}"
+          ],
+          "privateKey": "${PRIVATE_KEY}",
+          "shortIds": [
+            "",
+            "${SHORT_ID}"
+          ]
+        }
+EOS
+)
+  fi
+
   cat > "$XRAY_CONF" <<EOF
 {
   "log": {
@@ -287,21 +338,7 @@ rebuild_xray_config() {
         "decryption": "none"
       },
       "streamSettings": {
-        "network": "tcp",
-        "security": "reality",
-        "realitySettings": {
-          "show": false,
-          "dest": "${REALITY_DEST}",
-          "xver": 0,
-          "serverNames": [
-            "${REALITY_SNI}"
-          ],
-          "privateKey": "${PRIVATE_KEY}",
-          "shortIds": [
-            "",
-            "${SHORT_ID}"
-          ]
-        }
+${STREAM_SETTINGS}
       },
       "sniffing": {
         "enabled": true,
@@ -752,6 +789,7 @@ do_install() {
       echo -e "  ${BOLD}当前配置${NC}"
       line
       echo -e "  模式      : ${MODE:-domain}"
+      echo -e "  传输      : ${TRANSPORT:-tcp}"
       if [[ "${MODE:-domain}" == "ip" ]]; then
         echo -e "  服务器IP  : ${SERVER_IP:-未知}"
         echo -e "  伪装域名  : ${DEST_DOMAIN:-未知}"
@@ -801,6 +839,25 @@ do_install() {
     *) MODE="ip" ;;
   esac
   info "已选择: $([ "$MODE" = "ip" ] && echo "IP模式" || echo "域名模式")"
+
+  # ---------- 选择传输方式 ----------
+  step "选择传输方式"
+  echo
+  mi 1 "TCP + Vision" "经典 Reality + Vision 流控（推荐，性能最好）"
+  mi 2 "XHTTP"        "XHTTP 传输（更现代，抗检测更好，可过部分中间盒）"
+  echo
+  read -rp "  请选择 [1-2] (默认 1): " TRANS_SEL
+  TRANS_SEL=${TRANS_SEL:-1}
+  if [[ "$TRANS_SEL" == "2" ]]; then
+    TRANSPORT="xhttp"
+    # 生成随机路径（XHTTP 必须）
+    XHTTP_PATH="/$(openssl rand -hex 12)"
+    info "已选择: XHTTP 传输，路径: ${XHTTP_PATH}"
+  else
+    TRANSPORT="tcp"
+    XHTTP_PATH=""
+    info "已选择: TCP + Vision"
+  fi
 
   # ---------- 参数收集 ----------
   step "参数配置"
@@ -1056,6 +1113,8 @@ do_install() {
   INSTALL_TIME=$(date '+%Y-%m-%d %H:%M:%S')
   cat > "$INFO_FILE" <<EOF
 MODE="${MODE}"
+TRANSPORT="${TRANSPORT:-tcp}"
+XHTTP_PATH="${XHTTP_PATH:-}"
 ACME_CHALLENGE="${ACME_CHALLENGE:-}"
 DOMAIN="${DOMAIN:-}"
 EMAIL="${EMAIL:-}"
@@ -1453,6 +1512,7 @@ do_status() {
   echo -e "  ${BOLD}基本信息${NC}"
   line
   echo -e "  模式      : ${MODE:-domain}"
+  echo -e "  传输      : ${TRANSPORT:-tcp}"
   if [[ "${MODE:-domain}" == "ip" ]]; then
     echo -e "  服务器IP  : ${SERVER_IP:-未知}"
     echo -e "  伪装域名  : ${DEST_DOMAIN:-未知}"
@@ -1536,8 +1596,14 @@ show_client_info() {
   echo -e "  地址        : ${ADDR}"
   echo -e "  端口        : ${XRAY_PORT}"
   echo -e "  UUID        : ${uuid}"
-  echo -e "  流控        : xtls-rprx-vision"
-  echo -e "  传输        : tcp"
+  if [[ "${TRANSPORT:-tcp}" == "xhttp" ]]; then
+    echo -e "  传输        : xhttp"
+    echo -e "  路径        : ${XHTTP_PATH:-/xhttp}"
+    echo -e "  模式        : auto"
+  else
+    echo -e "  流控        : xtls-rprx-vision"
+    echo -e "  传输        : tcp"
+  fi
   echo -e "  安全        : reality"
   echo -e "  SNI         : ${SNI}"
   echo -e "  Fingerprint : chrome"
@@ -1545,7 +1611,13 @@ show_client_info() {
   echo -e "  ShortId     : ${SHORT_ID}"
   echo
   echo -e "${CYAN}  ╭───────────────── 分享链接 ─────────────────╮${NC}"
-  echo "  vless://${uuid}@${ADDR}:${XRAY_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&headerType=none#Reality-${email:-${ADDR}}"
+  if [[ "${TRANSPORT:-tcp}" == "xhttp" ]]; then
+    local path_enc
+    path_enc=$(printf '%s' "${XHTTP_PATH:-/xhttp}" | sed 's|/|%2F|g')
+    echo "  vless://${uuid}@${ADDR}:${XRAY_PORT}?encryption=none&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=xhttp&path=${path_enc}&mode=auto#Reality-XHTTP-${email:-${ADDR}}"
+  else
+    echo "  vless://${uuid}@${ADDR}:${XRAY_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&headerType=none#Reality-${email:-${ADDR}}"
+  fi
   echo -e "${CYAN}  ╰────────────────────────────────────────────╯${NC}"
 
   if [[ "${MODE:-domain}" == "domain" ]]; then
@@ -1731,12 +1803,25 @@ users_show() {
   echo -e "  地址        : ${ADDR}"
   echo -e "  端口        : ${XRAY_PORT}"
   echo -e "  UUID        : ${uuid}"
+  if [[ "${TRANSPORT:-tcp}" == "xhttp" ]]; then
+    echo -e "  传输        : xhttp"
+    echo -e "  路径        : ${XHTTP_PATH:-/xhttp}"
+  else
+    echo -e "  流控        : xtls-rprx-vision"
+    echo -e "  传输        : tcp"
+  fi
   echo -e "  SNI         : ${SNI}"
   echo -e "  PublicKey   : ${PUBLIC_KEY}"
   echo -e "  ShortId     : ${SHORT_ID}"
   echo
   echo -e "${CYAN}  ╭───────────────── 分享链接 ─────────────────╮${NC}"
-  echo "  vless://${uuid}@${ADDR}:${XRAY_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&headerType=none#Reality-${email}"
+  if [[ "${TRANSPORT:-tcp}" == "xhttp" ]]; then
+    local path_enc
+    path_enc=$(printf '%s' "${XHTTP_PATH:-/xhttp}" | sed 's|/|%2F|g')
+    echo "  vless://${uuid}@${ADDR}:${XRAY_PORT}?encryption=none&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=xhttp&path=${path_enc}&mode=auto#Reality-XHTTP-${email}"
+  else
+    echo "  vless://${uuid}@${ADDR}:${XRAY_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&headerType=none#Reality-${email}"
+  fi
   echo -e "${CYAN}  ╰────────────────────────────────────────────╯${NC}"
   echo
   read -rp "  按回车返回..." _
@@ -1761,6 +1846,7 @@ do_diagnose() {
   echo -e "  ${BOLD}基本信息${NC}"
   line
   echo -e "  模式      : ${MODE:-未知}"
+  echo -e "  传输      : ${TRANSPORT:-tcp}"
   echo -e "  端口      : ${XRAY_PORT:-未知}"
   [[ "$MODE" == "ip" ]] && echo -e "  伪装目标  : ${DEST_DOMAIN:-未知}"
   [[ "$MODE" == "domain" ]] && echo -e "  验证方式  : ${ACME_CHALLENGE:-http}"
