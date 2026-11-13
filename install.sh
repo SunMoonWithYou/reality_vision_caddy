@@ -3,6 +3,7 @@
 # Xray Reality + Vision / XHTTP 一键管理脚本
 # ----------------------------------------------------------------------------
 # 项目名称 : Xray Reality + Vision / XHTTP 一键管理脚本
+# Xray 版本 : 固定 v26.6.27
 # 支持系统 : Debian 11/12/13、Ubuntu 20.04/22.04/24.04
 # 运行权限 : 必须以 root 用户执行
 # ----------------------------------------------------------------------------
@@ -59,19 +60,19 @@ step() {
 
 # 大标题横幅：双线框，内容居中对齐
 banner() {
-  local t="$*"
   echo -e "${CYAN}"
-  echo "  ================================================"
-  echo "  $t"
-  echo "  ================================================"
+  echo -e "  ╔═════════════════════════════════════════════════╗"
+  echo -e "  ║                                                 ║"
+  printf  "  ║   %-45s ║\n" "$*"
+  echo -e "  ║                                                 ║"
+  echo -e "  ╚═════════════════════════════════════════════════╝"
   echo -e "${NC}"
 }
 
 # 菜单项输出：编号高亮 + 名称左对齐 + 说明暗色
 # 用法: mi <编号> <名称> <说明>
 mi() {
-  printf "  ${GREEN}[%s]${NC}  %s\n" "$1" "$2"
-  printf "      ${DIM}%s${NC}\n" "$3"
+  printf "  ${GREEN}[%s]${NC}  %-14s  ${DIM}%s${NC}\n" "$1" "$2" "$3"
 }
 
 # 统一分隔线
@@ -146,10 +147,10 @@ BUILTIN_DESTS=(
 # ============================================================================
 show_menu() {
   clear
-  banner "Xray Reality + Vision / XHTTP"
+  banner "Xray Reality + Vision / XHTTP  一键管理脚本"
   echo
   echo -e "  ${BOLD}功能菜单${NC}"
-  echo
+  line
   mi 1 "安装服务" "域名模式 / IP模式 一键部署"
   mi 2 "卸载服务" "停止并清理全部组件"
   mi 3 "查看状态" "服务运行状态与端口监听"
@@ -158,7 +159,7 @@ show_menu() {
   mi 6 "诊断自检" "连不上时优先使用（只读）"
   mi 7 "流量统计" "按月查看用户累计流量"
   mi 8 "TG 日报" "配置 / 测试 Telegram 每日流量推送"
-  echo
+  line
   mi 0 "退出脚本" "安全退出"
   echo
   echo -e "  ${YELLOW}提示：连接异常时请先执行 [6] 诊断自检${NC}"
@@ -1049,10 +1050,9 @@ do_install() {
   fi
 
   # ---------- 安装 Xray ----------
-  step "安装 Xray"
-  if [[ ! -x /usr/local/bin/xray ]]; then
-    bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
-  fi
+  step "安装 Xray v26.6.27"
+  info "正在安装指定版本 Xray v26.6.27 ..."
+  bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install --version v26.6.27
 
   # ---------- 出网预检 ----------
   step "出网预检"
