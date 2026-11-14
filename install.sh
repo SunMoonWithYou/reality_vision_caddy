@@ -22,6 +22,9 @@
 #   7. 流量统计   : 按月查看每个用户的长期累计流量（详细历史保留 1 年）
 #                  支持每小时自动累计（systemd timer）
 #   8. TG 日报    : 配置 Telegram Bot，每天 01:00 自动推送昨日流量日报
+#   9. 流量开关   : 开启 / 关闭流量统计（关闭后不再写入 stats 段）
+#                  定时任务（助手脚本 + systemd 单元）的校验与自动修复
+#                  只在“开启流量统计”时执行，主菜单不再每次巡检
 # ----------------------------------------------------------------------------
 # 非交互模式:
 #   ./脚本 --accumulate   供流量累计定时任务调用
@@ -50,6 +53,22 @@ info()  { echo -e "${GREEN}[INFO]${NC} $*"; }
 warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
 error() { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
 
+# 确保 python3 存在，没有就自动安装
+ensure_python3() {
+  if command -v python3 >/dev/null 2>&1; then
+    return 0
+  fi
+  info "未检测到 python3，正在自动安装..."
+  apt-get update -y >/dev/null 2>&1 || true
+  if apt-get install -y python3 >/dev/null 2>&1; then
+    info "python3 安装完成"
+    return 0
+  else
+    warn "python3 自动安装失败，请手动执行: apt-get install -y python3"
+    return 1
+  fi
+}
+
 # 步骤标题：圆角边框 + 箭头
 step() {
   echo
@@ -58,26 +77,41 @@ step() {
   echo -e "${BLUE}  ╰─────────────────────────────────────────────────╯${NC}"
 }
 
-# 大标题横幅：双线框，内容居中对齐
+# 计算字符串显示宽度（中文算2）
+display_width() {
+  local s="$1" w=0
+  local i c
+  for ((i=0; i<${#s}; i++)); do
+    c="${s:$i:1}"
+    if [[ "$c" =~ [一-龥] ]]; then
+      ((w+=2))
+    else
+      ((w+=1))
+    fi
+  done
+  echo "$w"
+}
+
+# 大标题（无框简洁版）
 banner() {
-  echo -e "${CYAN}"
-  echo -e "  ╔═════════════════════════════════════════════════╗"
-  echo -e "  ║                                                 ║"
-  printf  "  ║   %-45s ║\n" "$*"
-  echo -e "  ║                                                 ║"
-  echo -e "  ╚═════════════════════════════════════════════════╝"
-  echo -e "${NC}"
+  local title="$1"
+  echo
+  echo -e "  ${CYAN}${BOLD}▶ ${title}${NC}"
+  echo -e "  ${CYAN}────────────────────────────────────────────────────${NC}"
+  echo
 }
 
-# 菜单项输出：编号高亮 + 名称左对齐 + 说明暗色
-# 用法: mi <编号> <名称> <说明>
+# 菜单项输出（美化两行式）
 mi() {
-  printf "  ${GREEN}[%s]${NC}  %-14s  ${DIM}%s${NC}\n" "$1" "$2" "$3"
+  local num="$1" name="$2" desc="$3"
+  printf "  ${GREEN}┌─${NC} ${BOLD}[%s]${NC}  ${CYAN}%s${NC}\n" "$num" "$name"
+  printf "  ${GREEN}└─${NC}     ${DIM}%s${NC}\n" "$desc"
+  echo
 }
 
-# 统一分隔线
+# 分隔线
 line() {
-  echo -e "  ─────────────────────────────────────────────────"
+  echo -e "  ${BLUE}────────────────────────────────────────────────────${NC}"
 }
 
 # ----------------------------------------------------------------------------
@@ -110,6 +144,9 @@ INFO_FILE=/etc/reality-caddy/info.txt            # 安装信息持久化文件
 TRAFFIC_FILE=/etc/reality-caddy/traffic.json     # 长期流量累计文件
 TG_CONF=/etc/reality-caddy/telegram.conf         # Telegram 配置文件
 XRAY_CONF=/usr/local/etc/xray/config.json        # Xray 主配置文件路径
+TIMER_HELPER=/usr/local/bin/xray-reality-timer   # 定时任务专用助手脚本（固定路径）
+TG_TIMER_ON_FILE=/etc/reality-caddy/tg_timer.enabled  # TG 日报定时的启用标记（存在=用户启用过）
+TRAFFIC_STATS=1                                  # 流量统计开关：1 开启 / 0 关闭（由 info.txt 覆盖）
 LOG_RETENTION_DAYS=7                             # 日志保留天数
 CADDY_BIN=""                                     # Caddy 可执行文件路径（安装后赋值）
 ACME_CHALLENGE=""                                # 证书验证方式：http 或 dns
@@ -143,14 +180,241 @@ BUILTIN_DESTS=(
 )
 
 # ============================================================================
+# 安装固定路径的定时任务助手脚本（独立于主脚本）
+# ============================================================================
+install_timer_helper() {
+  cat > "$TIMER_HELPER" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+MODE="${1:-}"
+INFO_FILE=/etc/reality-caddy/info.txt
+TRAFFIC_FILE=/etc/reality-caddy/traffic.json
+USERS_FILE=/etc/reality-caddy/users.txt
+TG_CONF=/etc/reality-caddy/telegram.conf
+
+ensure_python3() {
+  command -v python3 >/dev/null 2>&1 && return 0
+  apt-get update -y >/dev/null 2>&1 || true
+  apt-get install -y python3 >/dev/null 2>&1 || true
+}
+
+accumulate() {
+  ensure_python3 || exit 1
+  [[ -f "$INFO_FILE" ]] || exit 1
+  [[ -x /usr/local/bin/xray ]] || exit 1
+  systemctl is-active --quiet xray || exit 1
+
+  local API_ADDR="127.0.0.1:10085"
+  local TMPRAW
+  TMPRAW=$(mktemp)
+
+  timeout 15 xray api statsquery --server="$API_ADDR" >"$TMPRAW" 2>/dev/null || true
+  [[ -s "$TMPRAW" ]] || { rm -f "$TMPRAW"; exit 1; }
+
+  python3 - "$TMPRAW" "$TRAFFIC_FILE" <<'PY'
+import json, sys, os, time
+from datetime import datetime, timedelta
+
+raw_file, traffic_file = sys.argv[1], sys.argv[2]
+try:
+    with open(raw_file, encoding="utf-8") as f:
+        content = f.read().strip()
+    if not content.startswith("{"):
+        idx = content.find("{")
+        if idx >= 0: content = content[idx:]
+    data = json.loads(content)
+except Exception:
+    sys.exit(1)
+
+delta = {}
+for item in data.get("stat", []):
+    name = item.get("name", "")
+    if name.startswith("user>>>") and ">>>traffic>>>" in name:
+        parts = name.split(">>>")
+        if len(parts) >= 4:
+            email, direction = parts[1], parts[3]
+            try:
+                value = int(item.get("value", 0))
+            except:
+                value = 0
+            delta.setdefault(email, {"uplink": 0, "downlink": 0})
+            delta[email][direction] = value
+
+store = {"cumulative": {}, "daily": [], "_meta": {}}
+if os.path.isfile(traffic_file):
+    try:
+        with open(traffic_file) as f:
+            store = json.load(f)
+    except: pass
+
+store.setdefault("cumulative", {})
+store.setdefault("daily", [])
+today = datetime.now().strftime("%Y-%m-%d")
+
+for email, d in delta.items():
+    if email not in store["cumulative"]:
+        store["cumulative"][email] = {"uplink": 0, "downlink": 0}
+    store["cumulative"][email]["uplink"] += d.get("uplink", 0)
+    store["cumulative"][email]["downlink"] += d.get("downlink", 0)
+
+found = False
+for rec in store["daily"]:
+    if rec.get("date") == today:
+        for email, d in delta.items():
+            if email not in rec.setdefault("users", {}):
+                rec["users"][email] = {"uplink": 0, "downlink": 0}
+            rec["users"][email]["uplink"] += d.get("uplink", 0)
+            rec["users"][email]["downlink"] += d.get("downlink", 0)
+        found = True
+        break
+if not found and delta:
+    store["daily"].append({"date": today, "users": {e: dict(d) for e, d in delta.items()}})
+
+cutoff = (datetime.now() - timedelta(days=365)).strftime("%Y-%m-%d")
+store["daily"] = [r for r in store["daily"] if r.get("date", "9999") >= cutoff]
+store["_meta"] = {
+    "last_update": int(time.time()),
+    "last_update_str": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    "retention_days": 365
+}
+
+os.makedirs(os.path.dirname(traffic_file), exist_ok=True)
+with open(traffic_file, "w") as f:
+    json.dump(store, f, indent=2, ensure_ascii=False)
+os.chmod(traffic_file, 0o600)
+print("OK")
+PY
+
+  timeout 10 xray api statsquery --server="$API_ADDR" -reset=true >/dev/null 2>&1 || true
+  rm -f "$TMPRAW"
+}
+
+tg_report() {
+  accumulate >/dev/null 2>&1 || true
+  [[ -f "$TRAFFIC_FILE" ]] || exit 1
+
+  TG_BOT_TOKEN=""
+  TG_CHAT_ID=""
+  if [[ -f "$TG_CONF" ]]; then
+    while IFS='=' read -r k v; do
+      [[ -z "$k" || "$k" =~ ^# ]] && continue
+      v=${v%\"}; v=${v#\"}
+      case "$k" in
+        BOT_TOKEN) TG_BOT_TOKEN="$v" ;;
+        CHAT_ID)   TG_CHAT_ID="$v" ;;
+      esac
+    done < "$TG_CONF"
+  fi
+  [[ -n "$TG_BOT_TOKEN" && -n "$TG_CHAT_ID" ]] || exit 1
+
+  local SRV_IP
+  SRV_IP=$(grep -oP 'SERVER_IP="\K[^"]+' "$INFO_FILE" 2>/dev/null || true)
+  [[ -z "$SRV_IP" ]] && SRV_IP=$(curl -4 -s --max-time 5 https://ifconfig.me 2>/dev/null || echo "未知")
+
+  local report
+  report=$(python3 - "$TRAFFIC_FILE" "$SRV_IP" "$USERS_FILE" <<'PY'
+import json, sys, os
+from datetime import datetime, timedelta
+from collections import defaultdict
+
+try:
+    with open(sys.argv[1]) as f:
+        store = json.load(f)
+except:
+    sys.exit(1)
+
+srv_ip = sys.argv[2]
+users_file = sys.argv[3]
+
+email_to_note = {}
+if users_file and os.path.isfile(users_file):
+    with open(users_file) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"): continue
+            parts = line.split("|")
+            if len(parts) >= 2:
+                email = parts[1]
+                note = parts[2].strip() if len(parts) >= 3 else ""
+                email_to_note[email] = note if note else email
+
+def display_name(e):
+    return email_to_note.get(e, e)
+
+daily = store.get("daily", [])
+yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+y_users = defaultdict(lambda: {"uplink": 0, "downlink": 0})
+for rec in daily:
+    if rec.get("date") == yesterday:
+        for email, d in rec.get("users", {}).items():
+            y_users[email]["uplink"] += d.get("uplink", 0)
+            y_users[email]["downlink"] += d.get("downlink", 0)
+
+def fmt(b):
+    b = int(b or 0)
+    if b < 1024: return f"{b} B"
+    if b < 1024**2: return f"{b/1024:.1f} KB"
+    if b < 1024**3: return f"{b/1024**2:.1f} MB"
+    return f"{b/1024**3:.2f} GB"
+
+lines = [
+    "📊 <b>Xray Reality 流量日报</b>",
+    f"📅 日期：<code>{yesterday}</code>",
+    f"🖥 服务器：<code>{srv_ip}</code>",
+    ""
+]
+if not y_users:
+    lines.append("😴 昨日无流量记录")
+else:
+    total_up = total_down = 0
+    for email in sorted(y_users.keys(), key=lambda e: -(y_users[e]["uplink"] + y_users[e]["downlink"])):
+        up = y_users[email]["uplink"]
+        down = y_users[email]["downlink"]
+        total_up += up
+        total_down += down
+        lines.append(f"👤 <b>{display_name(email)}</b>")
+        lines.append(f"   ⬆️ 上行  <code>{fmt(up)}</code>")
+        lines.append(f"   ⬇️ 下行  <code>{fmt(down)}</code>")
+        lines.append("")
+    lines.append("📈 <b>合计</b>")
+    lines.append(f"   ⬆️ 上行  <code>{fmt(total_up)}</code>")
+    lines.append(f"   ⬇️ 下行  <code>{fmt(total_down)}</code>")
+    lines.append(f"   📦 总计  <code>{fmt(total_up + total_down)}</code>")
+
+lines.append("")
+lines.append(f"⏰ 生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+print("\n".join(lines))
+PY
+)
+
+  [[ -n "$report" ]] || exit 1
+
+  curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+    -d "chat_id=${TG_CHAT_ID}" \
+    --data-urlencode "text=${report}" \
+    -d "parse_mode=HTML" \
+    -d "disable_web_page_preview=true" >/dev/null
+}
+
+case "$MODE" in
+  --accumulate) accumulate ;;
+  --tg-report)  tg_report ;;
+  *) echo "Usage: $0 --accumulate | --tg-report"; exit 1 ;;
+esac
+EOF
+  chmod +x "$TIMER_HELPER"
+}
+
+# ============================================================================
 # 主菜单显示函数
 # ============================================================================
 show_menu() {
   clear
   banner "Xray Reality + Vision / XHTTP  一键管理脚本"
-  echo
-  echo -e "  ${BOLD}功能菜单${NC}"
+  echo -e "  ${BOLD}${CYAN}功能菜单${NC}"
   line
+  echo
   mi 1 "安装服务" "域名模式 / IP模式 一键部署"
   mi 2 "卸载服务" "停止并清理全部组件"
   mi 3 "查看状态" "服务运行状态与端口监听"
@@ -159,12 +423,14 @@ show_menu() {
   mi 6 "诊断自检" "连不上时优先使用（只读）"
   mi 7 "流量统计" "按月查看用户累计流量"
   mi 8 "TG 日报" "配置 / 测试 Telegram 每日流量推送"
+  mi 9 "流量开关" "启用 / 关闭流量统计（含定时任务校验）"
   line
+  echo
   mi 0 "退出脚本" "安全退出"
   echo
   echo -e "  ${YELLOW}提示：连接异常时请先执行 [6] 诊断自检${NC}"
   echo
-  read -rp "  请选择 [0-8]: " CHOICE
+  read -rp "  请选择 [0-9]: " CHOICE
 }
 
 # ============================================================================
@@ -185,18 +451,16 @@ load_kv() {
   [[ ! -f "$FILE" ]] && return 1
   while IFS='=' read -r key value; do
     [[ -z "$key" || "$key" =~ ^# ]] && continue
-    key=$(echo "$key" | xargs)                    # 去除空白
-    value=${value%\"}; value=${value#\"}          # 去除双引号
-    value=${value%\'}; value=${value#\'}          # 去除单引号
-    printf -v "$key" '%s' "$value"                # 动态赋值给变量
+    key=$(echo "$key" | xargs)
+    value=${value%\"}; value=${value#\"}
+    value=${value%\'}; value=${value#\'}
+    printf -v "$key" '%s' "$value"
   done < "$FILE"
   return 0
 }
 
 # ============================================================================
 # 根据 users.txt 生成 Xray clients JSON 数组
-# 每行格式: uuid|email|note
-# 输出带正确逗号分隔的 JSON 数组字符串
 # ============================================================================
 build_clients_json() {
   [[ ! -f "$USERS_FILE" ]] && { echo '[]'; return; }
@@ -225,9 +489,6 @@ build_clients_json() {
 
 # ============================================================================
 # 重建 Xray 主配置文件
-# 根据当前 MODE（domain/ip）决定 REALITY 的 dest 和 serverNames
-# 域名模式: dest 指向本地 Caddy (127.0.0.1:8003)
-# IP 模式  : dest 指向用户选择的真实网站
 # ============================================================================
 rebuild_xray_config() {
   load_kv "$INFO_FILE" || error "未找到 $INFO_FILE，请先安装"
@@ -238,32 +499,25 @@ rebuild_xray_config() {
 
   local REALITY_DEST REALITY_SNI
   if [[ "${MODE:-domain}" == "ip" ]]; then
-    # IP 模式：校验并探测伪装目标
     local NORM
     NORM=$(normalize_dest "${DEST_DOMAIN:-}" 2>/dev/null) || {
       warn "伪装目标域名不合法: [${DEST_DOMAIN:-空}]"
-      warn "要求：纯域名，不带 https:// 前缀、不带路径、不能是纯 IP"
       return 1
     }
     DEST_DOMAIN="$NORM"
 
     if ! probe_dest_tls "$DEST_DOMAIN" 443; then
       warn "伪装目标 ${DEST_DOMAIN} 的 TLS 握手探测失败"
-      warn "该目标无法作为 REALITY 的 dest，生成的节点会『连上即断』"
-      warn "请重新安装并换一个目标，或手动执行以下命令确认："
-      warn "  openssl s_client -connect ${DEST_DOMAIN}:443 -servername ${DEST_DOMAIN} -tls1_3 -brief"
       return 1
     fi
 
     REALITY_DEST="${DEST_DOMAIN}:443"
     REALITY_SNI="${DEST_DOMAIN}"
   else
-    # 域名模式：流量最终落到本地 Caddy 伪装站
     REALITY_DEST="127.0.0.1:8003"
     REALITY_SNI="${DOMAIN}"
   fi
 
-  # 写入完整 Xray 配置（已启用用户流量统计）
   local STREAM_SETTINGS
   if [[ "${TRANSPORT:-tcp}" == "xhttp" ]]; then
     STREAM_SETTINGS=$(cat <<EOS
@@ -273,14 +527,9 @@ rebuild_xray_config() {
           "show": false,
           "dest": "${REALITY_DEST}",
           "xver": 0,
-          "serverNames": [
-            "${REALITY_SNI}"
-          ],
+          "serverNames": ["${REALITY_SNI}"],
           "privateKey": "${PRIVATE_KEY}",
-          "shortIds": [
-            "",
-            "${SHORT_ID}"
-          ]
+          "shortIds": ["", "${SHORT_ID}"]
         },
         "xhttpSettings": {
           "path": "${XHTTP_PATH:-/xhttp}",
@@ -296,31 +545,25 @@ EOS
           "show": false,
           "dest": "${REALITY_DEST}",
           "xver": 0,
-          "serverNames": [
-            "${REALITY_SNI}"
-          ],
+          "serverNames": ["${REALITY_SNI}"],
           "privateKey": "${PRIVATE_KEY}",
-          "shortIds": [
-            "",
-            "${SHORT_ID}"
-          ]
+          "shortIds": ["", "${SHORT_ID}"]
         }
 EOS
 )
   fi
 
-  cat > "$XRAY_CONF" <<EOF
-{
-  "log": {
-    "loglevel": "warning"
-  },
-  "stats": {},
+  # 流量统计开关关闭时，不写入 stats / api / policy 段（真正的“关闭统计”）
+  local STATS_BLOCK="" POLICY_BLOCK=""
+  if [[ "${TRAFFIC_STATS:-1}" == "1" ]]; then
+    STATS_BLOCK='  "stats": {},
   "api": {
     "tag": "api",
     "listen": "127.0.0.1:10085",
     "services": ["StatsService"]
   },
-  "policy": {
+'
+    POLICY_BLOCK='  "policy": {
     "levels": {
       "0": {
         "statsUserUplink": true,
@@ -328,7 +571,13 @@ EOS
       }
     }
   },
-  "inbounds": [
+'
+  fi
+
+  cat > "$XRAY_CONF" <<EOF
+{
+  "log": {"loglevel": "warning"},
+${STATS_BLOCK}${POLICY_BLOCK}  "inbounds": [
     {
       "listen": "0.0.0.0",
       "port": ${XRAY_PORT},
@@ -349,17 +598,13 @@ ${STREAM_SETTINGS}
     }
   ],
   "outbounds": [
-    {
-      "protocol": "freedom",
-      "tag": "direct"
-    }
+    {"protocol": "freedom", "tag": "direct"}
   ]
 }
 EOF
 
-  # 配置语法校验
   if ! xray -test -config "$XRAY_CONF" >/dev/null 2>&1; then
-    warn "Xray 配置校验失败，输出："
+    warn "Xray 配置校验失败"
     xray -test -config "$XRAY_CONF" || true
     return 1
   fi
@@ -368,14 +613,11 @@ EOF
 
 # ============================================================================
 # 自动放行本机防火墙端口
-# 按优先级检测 firewalld → ufw → iptables
-# 只放行 TCP 协议
 # ============================================================================
 open_firewall_port() {
   local ports=("$@")
   local opened=0
 
-  # firewalld
   if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld 2>/dev/null; then
     for p in "${ports[@]}"; do
       firewall-cmd --permanent --add-port="${p}/tcp" >/dev/null 2>&1 || true
@@ -385,7 +627,6 @@ open_firewall_port() {
     opened=1
   fi
 
-  # ufw
   if command -v ufw >/dev/null 2>&1; then
     local st
     st=$(ufw status 2>/dev/null | head -n1 || true)
@@ -398,7 +639,6 @@ open_firewall_port() {
     fi
   fi
 
-  # 裸 iptables（最后手段，重启可能丢失）
   if [[ $opened -eq 0 ]] && command -v iptables >/dev/null 2>&1; then
     local changed=0
     for p in "${ports[@]}"; do
@@ -407,18 +647,18 @@ open_firewall_port() {
     done
     if [[ $changed -eq 1 ]]; then
       command -v netfilter-persistent >/dev/null 2>&1 && netfilter-persistent save >/dev/null 2>&1 || true
-      info "iptables: 已放行 TCP ${ports[*]}（重启后可能失效，建议改用 ufw/firewalld）"
+      info "iptables: 已放行 TCP ${ports[*]}"
       opened=1
     fi
   fi
 
   if [[ $opened -eq 0 ]]; then
-    info "未检测到启用中的本机防火墙（firewalld/ufw/iptables 规则为空）"
+    info "未检测到启用中的本机防火墙"
   fi
 }
 
 # ============================================================================
-# 打印端口放行提醒（云厂商安全组 + 本机防火墙）
+# 打印端口放行提醒
 # ============================================================================
 print_port_notice() {
   local mode=$1
@@ -430,43 +670,35 @@ print_port_notice() {
     echo -e "  │  必须放行：${CYAN}TCP ${port}${NC}（Xray 监听端口）"
   else
     if [[ "${ACME_CHALLENGE:-http}" == "http" ]]; then
-      echo -e "  │  必须放行：${CYAN}TCP 80${NC}（ACME HTTP-01 申请/续期证书）"
+      echo -e "  │  必须放行：${CYAN}TCP 80${NC}（ACME HTTP-01）"
     else
-      echo -e "  │  无需放行：TCP 80（当前使用 DNS-01 验证，Caddy 不监听 80）"
+      echo -e "  │  无需放行：TCP 80（DNS-01 模式）"
     fi
-    echo -e "  │            ${CYAN}TCP ${port}${NC}（Xray 监听端口，默认 443）"
+    echo -e "  │            ${CYAN}TCP ${port}${NC}（Xray 监听端口）"
   fi
   echo -e "  │  操作位置：云厂商控制台 → 安全组 / 防火墙 入站规则"
-  echo -e "  │            以及服务器本机防火墙（ufw / firewalld）"
-  echo -e "  │  提示    ：端口未放行时，客户端会连接超时或 TLS 握手失败"
   echo -e "${YELLOW}  ╰──────────────────────────────────────────────────────╯${NC}"
 }
 
 # ============================================================================
 # 处理常见 Web 服务端口占用
-# HTTP-01 模式：需要 80 端口，会主动停止 nginx/apache/caddy
-# DNS-01 模式：完全不动 80 端口上的任何服务，只检查 Xray 端口
 # ============================================================================
 handle_common_occupiers() {
   step "检测并处理常见端口占用"
 
   if [[ "${ACME_CHALLENGE:-http}" == "http" ]]; then
-    # HTTP-01：清理 80/443 上的常见服务
     systemctl is-active --quiet nginx 2>/dev/null && {
       warn "停止 Nginx"
       systemctl stop nginx
       systemctl disable nginx
     }
-
     systemctl is-active --quiet apache2 2>/dev/null && {
       warn "停止 Apache2"
       systemctl stop apache2
       systemctl disable apache2
     }
-
     systemctl stop apache2.socket 2>/dev/null || true
     systemctl disable apache2.socket 2>/dev/null || true
-
     systemctl stop caddy.service 2>/dev/null || true
     systemctl disable caddy.service 2>/dev/null || true
 
@@ -477,14 +709,12 @@ handle_common_occupiers() {
       info "80/443 端口空闲"
     fi
   else
-    # DNS-01：不动 80，只检查 Xray 端口
-    info "DNS-01 模式：Caddy 不监听 80，80 端口上的服务（nginx/apache 等）保持原样"
-    info "仅检查 Xray 端口 ${XRAY_PORT} 是否可用"
+    info "DNS-01 模式：Caddy 不监听 80"
     if ss -tlnp 2>/dev/null | grep -qE ":${XRAY_PORT}\b"; then
-      warn "端口 ${XRAY_PORT} 已被占用（Xray 需要该端口）："
+      warn "端口 ${XRAY_PORT} 已被占用"
       ss -tlnp | grep -E ":${XRAY_PORT}\b" || true
       read -rp "是否继续？[y/N]: " C
-      [[ "${C,,}" != "y" ]] && { info "已取消"; read -rp "  按回车返回..." _; exit 0; }
+      [[ "${C,,}" != "y" ]] && { info "已取消"; exit 0; }
     else
       info "端口 ${XRAY_PORT} 空闲"
     fi
@@ -492,8 +722,7 @@ handle_common_occupiers() {
 }
 
 # ============================================================================
-# 配置 systemd 日志与 Xray 日志的保留策略
-# 防止日志无限增长占满磁盘
+# 配置日志保留策略
 # ============================================================================
 configure_log_retention() {
   step "配置日志保留策略（${LOG_RETENTION_DAYS} 天）"
@@ -515,10 +744,8 @@ EOF
   mkdir -p /var/log/journal
   systemd-tmpfiles --create --prefix /var/log/journal 2>/dev/null || true
   systemctl restart systemd-journald
-
   journalctl --vacuum-time=${LOG_RETENTION_DAYS}d >/dev/null 2>&1 || true
 
-  # Xray 日志目录 + tmpfiles 清理规则
   mkdir -p /var/log/xray
   cat > /etc/tmpfiles.d/xray-log.conf <<EOF
 d /var/log/xray 0755 root root -
@@ -533,8 +760,6 @@ EOF
 
 # ============================================================================
 # 规范化伪装目标域名
-# 去除协议前缀、路径、端口、末尾点号
-# 拒绝纯 IP 地址和不合法域名格式
 # ============================================================================
 normalize_dest() {
   local raw=$1
@@ -545,12 +770,10 @@ normalize_dest() {
   raw=${raw%%:*}
   raw=${raw%.}
 
-  # 拒绝纯 IP
   if [[ "$raw" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
     return 1
   fi
 
-  # 简单域名合法性校验
   if [[ ! "$raw" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$ ]]; then
     return 1
   fi
@@ -560,8 +783,6 @@ normalize_dest() {
 
 # ============================================================================
 # 真实 TLS 1.3 握手探测
-# 使用 openssl s_client 检测目标是否支持 TLS1.3
-# 返回 0 = 可用，1 = 不可用
 # ============================================================================
 probe_dest_tls() {
   local host=$1
@@ -576,15 +797,10 @@ probe_dest_tls() {
           -tls1_3 -alpn h2,http/1.1 \
           -brief </dev/null 2>&1 || true)
 
-  # 成功检测到 TLS1.3
   if echo "$out" | grep -qiE 'Protocol version: *TLSv1\.3|Protocol  *: *TLSv1\.3'; then
-    if echo "$out" | grep -qiE 'Verification: *OK|Verify return code: *0'; then
-      return 0
-    fi
-    return 0   # 即使证书验证失败也认为握手成功（很多站点证书链问题不影响 REALITY）
+    return 0
   fi
 
-  # 明确失败信号
   if echo "$out" | grep -qiE 'alert|handshake failure|no protocols|timeout|Connection refused|connect:errno'; then
     return 1
   fi
@@ -593,29 +809,12 @@ probe_dest_tls() {
 }
 
 # ============================================================================
-# 批量探测候选目标（预留函数，当前未直接调用）
-# ============================================================================
-probe_dest_list() {
-  local d
-  for d in "$@"; do
-    if probe_dest_tls "$d" 443; then
-      printf '%s|OK\n' "$d"
-    else
-      printf '%s|FAIL\n' "$d"
-    fi
-  done
-}
-
-# ============================================================================
 # IP 模式：交互式选择伪装目标域名
-# 1. 先实测内置候选列表
-# 2. 只展示握手成功的目标
-# 3. 支持自定义输入
 # ============================================================================
 choose_dest_domain() {
   echo
   step "实测候选伪装目标（TLS1.3 握手探测）"
-  echo -e "  说明：只有握手正常的目标才能作为 dest，否则客户端会连上即断。"
+  echo -e "  说明：只有握手正常的目标才能作为 dest。"
   echo
 
   local -a GOOD=()
@@ -625,14 +824,13 @@ choose_dest_domain() {
       GOOD+=("$d")
       echo -e "  ${GREEN}[通过]${NC} $d"
     else
-      echo -e "  ${RED}[失败]${NC} $d  （TLS 握手异常，已从候选剔除）"
+      echo -e "  ${RED}[失败]${NC} $d"
     fi
   done
 
   echo
   if [[ ${#GOOD[@]} -eq 0 ]]; then
-    warn "内置候选全部握手失败，请手动输入一个可用的伪装域名"
-    warn "建议在客户端所在地测试：能正常用浏览器访问、支持 TLS1.3 的站点"
+    warn "内置候选全部握手失败，请手动输入"
     while true; do
       read -rp "  请输入自定义伪装域名: " DEST_DOMAIN
       if DEST_DOMAIN=$(normalize_dest "${DEST_DOMAIN:-}"); then
@@ -640,14 +838,14 @@ choose_dest_domain() {
           info "握手通过: $DEST_DOMAIN"
           return 0
         fi
-        warn "$DEST_DOMAIN 握手仍失败，请换一个"
+        warn "$DEST_DOMAIN 握手失败，请换一个"
       else
-        warn "域名格式不合法（不要带 https:// 或路径）"
+        warn "域名格式不合法"
       fi
     done
   fi
 
-  echo -e "  ${BLUE}▶ 请选择伪装目标域名${NC}  ${DIM}(仅显示实测通过的)${NC}"
+  echo -e "  ${BLUE}▶ 请选择伪装目标域名${NC}"
   line
   local i=1
   for d in "${GOOD[@]}"; do
@@ -664,17 +862,17 @@ choose_dest_domain() {
     DEST_DOMAIN="${GOOD[$((SEL-1))]}"
   elif [[ "$SEL" == "$i" ]]; then
     while true; do
-      read -rp "  请输入自定义伪装域名 (例如 www.example.com): " INPUT_DEST
+      read -rp "  请输入自定义伪装域名: " INPUT_DEST
       if DEST_DOMAIN=$(normalize_dest "${INPUT_DEST:-}"); then
         if probe_dest_tls "$DEST_DOMAIN" 443; then
           info "握手通过: $DEST_DOMAIN"
           break
         fi
-        warn "$DEST_DOMAIN 握手失败，作为 dest 会导致客户端连上即断"
+        warn "$DEST_DOMAIN 握手失败"
         read -rp "仍要使用它？[y/N]: " KEEP
         [[ "${KEEP,,}" == "y" ]] && break
       else
-        warn "域名格式不合法，请重新输入（不要带 https:// 或路径）"
+        warn "域名格式不合法"
       fi
     done
   else
@@ -686,7 +884,6 @@ choose_dest_domain() {
 
 # ============================================================================
 # 服务器出网连通性自检
-# 测试几个知名站点，成功数超过一半即判定出网正常
 # ============================================================================
 check_outbound() {
   local okn=0 total=0 url code
@@ -706,30 +903,7 @@ check_outbound() {
 }
 
 # ============================================================================
-# 检查 Caddy 是否已成功为指定域名签发证书
-# 优先检查证书文件，其次检查 journal 日志关键词
-# ============================================================================
-check_cert_obtained() {
-  local dom=$1
-  [[ -z "$dom" ]] && return 1
-
-  local storages=( "/root/.local/share/caddy" "${HOME:-/root}/.local/share/caddy" )
-  local s
-  for s in "${storages[@]}"; do
-    [[ -d "$s/certificates" ]] || continue
-    if find "$s/certificates" -type f -name "${dom}.crt" -print -quit 2>/dev/null | grep -q .; then
-      return 0
-    fi
-  done
-
-  journalctl -u caddy-json.service --no-pager -n 300 2>/dev/null \
-    | grep -q "certificate obtained successfully" && return 0
-  return 1
-}
-
-# ============================================================================
 # 获取服务器公网 IPv4 地址
-# 依次尝试多个公共服务，返回第一个合法结果
 # ============================================================================
 get_public_ip() {
   local ip=""
@@ -746,8 +920,6 @@ get_public_ip() {
 
 # ============================================================================
 # 使用 xray x25519 生成 Reality 密钥对
-# 兼容不同版本 xray 的输出格式
-# 同时生成 8 字节随机 ShortId
 # ============================================================================
 generate_reality_keys() {
   local out
@@ -758,7 +930,6 @@ generate_reality_keys() {
   PRIVATE_KEY=${tmp[0]:-}
   PUBLIC_KEY=${tmp[1]:-}
 
-  # 兼容旧版输出格式
   if [[ -z "$PRIVATE_KEY" || -z "$PUBLIC_KEY" ]]; then
     PRIVATE_KEY=$(echo "$out" | grep -iE 'Private|私钥' | awk '{print $NF}')
     PUBLIC_KEY=$(echo "$out" | grep -iE 'Public|Password|公钥|密码' | awk '{print $NF}' | head -1)
@@ -769,7 +940,7 @@ generate_reality_keys() {
     PUBLIC_KEY=$(echo "$out" | sed -n '2p' | awk '{print $NF}')
   fi
 
-  [[ -z "$PRIVATE_KEY" || -z "$PUBLIC_KEY" ]] && error "生成 Reality 密钥失败，请检查 xray 版本"
+  [[ -z "$PRIVATE_KEY" || -z "$PUBLIC_KEY" ]] && error "生成 Reality 密钥失败"
 
   SHORT_ID=$(openssl rand -hex 8)
 }
@@ -780,7 +951,6 @@ generate_reality_keys() {
 do_install() {
   local KEEP_USERS=0
 
-  # ---------- 已安装检测与重装选项 ----------
   if is_installed; then
     clear
     banner "检测到已安装"
@@ -827,7 +997,6 @@ do_install() {
     esac
   fi
 
-  # ---------- 选择安装模式 ----------
   step "选择安装模式"
   echo
   mi 1 "域名模式" "自有域名 + Caddy 伪装站 + 自动证书（推荐 443）"
@@ -841,17 +1010,15 @@ do_install() {
   esac
   info "已选择: $([ "$MODE" = "ip" ] && echo "IP模式" || echo "域名模式")"
 
-  # ---------- 选择传输方式 ----------
   step "选择传输方式"
   echo
-  mi 1 "TCP + Vision" "经典 Reality + Vision 流控（推荐，性能最好）"
-  mi 2 "XHTTP"        "XHTTP 传输（更现代，抗检测更好，可过部分中间盒）"
+  mi 1 "TCP + Vision" "经典 Reality + Vision 流控（推荐）"
+  mi 2 "XHTTP"        "XHTTP 传输（更现代）"
   echo
   read -rp "  请选择 [1-2] (默认 1): " TRANS_SEL
   TRANS_SEL=${TRANS_SEL:-1}
   if [[ "$TRANS_SEL" == "2" ]]; then
     TRANSPORT="xhttp"
-    # 生成随机路径（XHTTP 必须）
     XHTTP_PATH="/$(openssl rand -hex 12)"
     info "已选择: XHTTP 传输，路径: ${XHTTP_PATH}"
   else
@@ -860,10 +1027,8 @@ do_install() {
     info "已选择: TCP + Vision"
   fi
 
-  # ---------- 参数收集 ----------
   step "参数配置"
   if [[ "$MODE" == "ip" ]]; then
-    # IP 模式参数
     local DETECTED_IP
     DETECTED_IP=$(get_public_ip)
     if [[ -n "$DETECTED_IP" ]]; then
@@ -884,15 +1049,13 @@ do_install() {
     ACME_CHALLENGE=""
     CF_API_TOKEN=""
   else
-    # 域名模式参数
     read -rp "  请输入你的域名 (例如: example.com): " DOMAIN
     [[ -z "$DOMAIN" ]] && error "域名不能为空"
 
-    # 先选择证书验证方式
     echo
     echo -e "  ${BLUE}▶ 证书验证方式${NC}"
     line
-    mi 1 "HTTP 验证" "HTTP-01，需占用 80 端口，配置最简单"
+    mi 1 "HTTP 验证" "HTTP-01，需占用 80 端口"
     mi 2 "DNS 验证"  "DNS-01，不占用 80，走 Cloudflare API"
     line
     echo
@@ -904,20 +1067,13 @@ do_install() {
       ACME_CHALLENGE="http"
     fi
 
-    # 根据验证方式处理邮箱
-    # 注意：Let's Encrypt 禁止使用 example.com 等保留域名的邮箱注册 ACME 账号
-    # (HTTP 400 invalidContact: forbidden domain)，会导致证书签发失败。
-    # 两种模式均需用户手动输入邮箱，并校验格式与保留域名。
     read -rp "  请输入用于 ACME 的邮箱 (如 admin@${DOMAIN}): " EMAIL
     [[ -z "$EMAIL" ]] && error "邮箱不能为空"
     if ! [[ "$EMAIL" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+$ ]]; then
       error "邮箱格式不合法: $EMAIL"
     fi
     if [[ "$EMAIL" =~ @(example\.com|example\.org|example\.net)$ ]]; then
-      error "Let's Encrypt 禁止使用 example.com/org/net 域名的邮箱（invalidContact），请换一个"
-    fi
-    if [[ "$ACME_CHALLENGE" == "dns" ]]; then
-      info "DNS-01 模式：使用邮箱 ${EMAIL} 注册 ACME 账号"
+      error "Let's Encrypt 禁止使用 example.com/org/net 域名的邮箱"
     fi
 
     read -rp "  请输入伪装站标题 (默认: Welcome): " SITE_TITLE
@@ -927,110 +1083,50 @@ do_install() {
     SERVER_IP=""
     DEST_DOMAIN=""
 
-    # DNS-01 需要 Cloudflare API Token
     CF_API_TOKEN=""
     if [[ "$ACME_CHALLENGE" == "dns" ]]; then
       echo
       warn "DNS-01 需要 Cloudflare API Token"
-      warn "权限要求：Zone.Zone:Read + Zone.DNS:Edit，作用域限定到 ${DOMAIN}"
-      warn "请先在 Cloudflare 后台创建，然后粘贴到下面（输入不回显）"
       read -rsp "  CF_API_TOKEN: " CF_API_TOKEN
       echo
       [[ -z "$CF_API_TOKEN" ]] && error "API Token 不能为空"
-      [[ "$CF_API_TOKEN" =~ [[:space:]] ]] && error "API Token 含空白字符，请检查"
-      # 简单格式预检
-      if [[ ! "$CF_API_TOKEN" =~ ^cf(ut|at)_[A-Za-z0-9_-]{32,256}$ \
-            && ! "$CF_API_TOKEN" =~ ^[A-Za-z0-9_-]{35,50}$ ]]; then
-        warn "Token 格式与 Cloudflare API Token 特征不符（长度 ${#CF_API_TOKEN}）"
-        warn "请确认输入的是 API Token，而不是 Global API Key，且未带引号/多余字符"
-        warn "格式不符时 caddy validate 会直接拒绝，可能导致安装失败"
-      fi
-      info "已接收 API Token（长度 ${#CF_API_TOKEN}）"
     fi
   fi
   info "参数已录入"
 
-  # 域名解析预检（仅域名模式）
-  if [[ "$MODE" == "domain" ]] && command -v dig >/dev/null 2>&1; then
-    RESOLVED_IP=$(dig +short "$DOMAIN" | tail -n1)
-    [[ -z "$RESOLVED_IP" ]] && warn "域名解析失败，证书申请可能不成功"
-  fi
-
-  # 生成初始用户 UUID
   UUID=$(cat /proc/sys/kernel/random/uuid)
   info "自动生成初始 UUID: $UUID"
 
-  # ---------- 安装基础依赖 ----------
   step "安装基础依赖"
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -y
-  apt-get install -y curl gnupg lsb-release ca-certificates openssl dnsutils
+  apt-get install -y curl gnupg lsb-release ca-certificates openssl dnsutils python3
 
-  # ---------- 域名模式安装 Caddy ----------
   if [[ "$MODE" == "domain" ]]; then
     step "安装 Caddy"
     if [[ "$ACME_CHALLENGE" == "dns" ]]; then
-      # DNS-01 需要带 cloudflare 插件的自定义 Caddy
       info "DNS-01 模式：将使用 xcaddy 构建带 Cloudflare 插件的 Caddy"
-
-      # 安装足够新的 Go
       if ! command -v go >/dev/null 2>&1 || ! go version 2>/dev/null | grep -qE 'go1\.(2[1-9]|[3-9][0-9])'; then
-        info "安装 Go 1.22（官方二进制）"
+        info "安装 Go 1.22"
         GO_INSTALLED_BY_SCRIPT=1
         local ARCH
         case "$(dpkg --print-architecture)" in
           amd64) ARCH="amd64" ;;
           arm64) ARCH="arm64" ;;
-          *) error "不支持的架构：$(dpkg --print-architecture)" ;;
+          *) error "不支持的架构" ;;
         esac
         rm -rf /usr/local/go
-        if ! curl -sSL "https://go.dev/dl/go1.22.5.linux-${ARCH}.tar.gz" | tar -xz -C /usr/local; then
-          error "Go 下载失败，请检查网络"
-        fi
+        curl -sSL "https://go.dev/dl/go1.22.5.linux-${ARCH}.tar.gz" | tar -xz -C /usr/local
         export PATH="/usr/local/go/bin:$PATH"
       fi
-
       export PATH="$PATH:/usr/local/go/bin:$(go env GOPATH)/bin"
-      XCADDY_INSTALLED_BY_SCRIPT=0
       if ! command -v xcaddy >/dev/null 2>&1; then
-        info "安装 xcaddy"
-        XCADDY_INSTALLED_BY_SCRIPT=1
-        if ! go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest; then
-          error "xcaddy 安装失败。若网络受限，可先执行 export GOPROXY=https://goproxy.cn,direct 后重试"
-        fi
+        go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
         export PATH="$PATH:$(go env GOPATH)/bin"
       fi
-      command -v xcaddy >/dev/null 2>&1 || error "xcaddy 安装失败"
-
-      info "正在编译 Caddy（首次约 2-5 分钟，请耐心等待）..."
-      if ! xcaddy build --with github.com/caddy-dns/cloudflare --output /usr/local/bin/caddy; then
-        error "Caddy 构建失败。若网络受限，可先执行 export GOPROXY=https://goproxy.cn,direct 后重试"
-      fi
+      xcaddy build --with github.com/caddy-dns/cloudflare --output /usr/local/bin/caddy
       CADDY_BIN=/usr/local/bin/caddy
-      [[ ! -x "$CADDY_BIN" ]] && error "Caddy 构建产物缺失"
-
-      # ---------- 清理编译工具链 ----------
-      # Caddy 二进制为静态编译，运行不依赖 Go；Go/xcaddy/缓存仅编译时需要，用完即删。
-      # 仅删除本脚本安装的部分，避免误删用户原有环境。
-      step "清理编译工具（Go / xcaddy / 构建缓存）"
-      local _GOPATH _GOCACHE
-      _GOPATH="$(go env GOPATH 2>/dev/null || echo '')"
-      _GOCACHE="$(go env GOCACHE 2>/dev/null || echo '')"
-      if [[ "$XCADDY_INSTALLED_BY_SCRIPT" == "1" ]]; then
-        rm -f "${_GOPATH}/bin/xcaddy" 2>/dev/null || true
-      fi
-      if [[ "$GO_INSTALLED_BY_SCRIPT" == "1" ]]; then
-        rm -rf /usr/local/go
-        [[ -n "${_GOPATH}" && "${_GOPATH}" != "$HOME" ]] && rm -rf "${_GOPATH}"
-        [[ -n "${_GOCACHE}" ]] && rm -rf "${_GOCACHE}"
-        hash -r 2>/dev/null || true
-        info "已删除 Go 工具链、xcaddy 及构建缓存"
-      else
-        info "检测到 Go 为系统原有环境，保留不动"
-      fi
-      info "清理完成，仅保留编译好的 Caddy 二进制（$CADDY_BIN）"
     else
-      # HTTP-01 使用官方 apt 包即可
       if ! command -v caddy >/dev/null 2>&1; then
         if [[ ! -f /usr/share/keyrings/caddy-stable-archive-keyring.gpg ]]; then
           curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
@@ -1039,65 +1135,54 @@ do_install() {
         curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' \
           | tee /etc/apt/sources.list.d/caddy-stable.list >/dev/null
         apt-get update -y
-        apt-get install -y caddy || apt-get install --reinstall -y caddy
+        apt-get install -y caddy
       fi
       CADDY_BIN=$(command -v caddy)
     fi
     [[ -z "$CADDY_BIN" || ! -x "$CADDY_BIN" ]] && error "Caddy 安装失败"
     info "Caddy: $($CADDY_BIN version)"
   else
-    info "IP 模式：跳过 Caddy 安装与伪装站部署"
+    info "IP 模式：跳过 Caddy 安装"
   fi
 
-  # ---------- 安装 Xray ----------
   step "安装 Xray v26.6.27"
-  info "正在安装指定版本 Xray v26.6.27 ..."
   bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install --version v26.6.27
 
-  # ---------- 出网预检 ----------
   step "出网预检"
   if ! check_outbound; then
-    warn "服务器出网受限："
-    warn "  - 域名模式：Caddy 可能申请不到证书"
-    warn "  - IP 模式 ：REALITY 认证后流量出不去，客户端表现为『连上没网』"
+    warn "服务器出网受限"
     read -rp "仍要继续安装？[y/N]: " C
-    [[ "${C,,}" != "y" ]] && { info "已取消安装"; read -rp "  按回车返回..." _; return; }
+    [[ "${C,,}" != "y" ]] && { info "已取消"; return; }
   fi
 
-  # ---------- 端口占用检查 ----------
   if [[ "$MODE" == "domain" ]]; then
     handle_common_occupiers
   else
     if ss -tlnp 2>/dev/null | grep -qE ":${XRAY_PORT}\b"; then
       warn "端口 ${XRAY_PORT} 已被占用"
-      ss -tlnp | grep -E ":${XRAY_PORT}\b" || true
       read -rp "是否继续？[y/N]: " C
       [[ "${C,,}" != "y" ]] && { info "已取消"; return; }
     fi
   fi
   configure_log_retention
 
-  # ---------- 放行防火墙端口 ----------
   step "放行防火墙端口"
   if [[ "$MODE" == "domain" ]]; then
     if [[ "$ACME_CHALLENGE" == "http" ]]; then
       open_firewall_port 80 "$XRAY_PORT"
     else
       open_firewall_port "$XRAY_PORT"
-      info "DNS-01 模式：无需放行 80 端口（不会改动 80 上的任何服务）"
     fi
   else
     open_firewall_port "$XRAY_PORT"
   fi
 
-  # ---------- 生成 Reality 密钥 ----------
   step "生成 Reality 密钥"
   generate_reality_keys
   info "PrivateKey: $PRIVATE_KEY"
   info "PublicKey : $PUBLIC_KEY"
   info "ShortId   : $SHORT_ID"
 
-  # ---------- 创建初始用户 ----------
   step "创建初始用户"
   mkdir -p /etc/reality-caddy
   if [[ "${KEEP_USERS:-0}" == "1" && -s "$USERS_FILE" ]]; then
@@ -1109,8 +1194,15 @@ do_install() {
   fi
   chmod 600 "$USERS_FILE"
 
-  # ---------- 持久化安装信息 ----------
   INSTALL_TIME=$(date '+%Y-%m-%d %H:%M:%S')
+
+  # 覆盖重装保留原流量统计开关状态；完全重装默认开启
+  if [[ "${KEEP_USERS:-0}" == "1" ]]; then
+    TRAFFIC_STATS=${TRAFFIC_STATS:-1}
+  else
+    TRAFFIC_STATS=1
+  fi
+
   cat > "$INFO_FILE" <<EOF
 MODE="${MODE}"
 TRANSPORT="${TRANSPORT:-tcp}"
@@ -1125,16 +1217,15 @@ XRAY_PORT="${XRAY_PORT}"
 PRIVATE_KEY="${PRIVATE_KEY}"
 PUBLIC_KEY="${PUBLIC_KEY}"
 SHORT_ID="${SHORT_ID}"
+TRAFFIC_STATS="${TRAFFIC_STATS}"
 INSTALL_TIME="${INSTALL_TIME}"
 EOF
   chmod 600 "$INFO_FILE"
 
-  # ---------- 域名模式：配置 Caddy + 伪装站 ----------
   if [[ "$MODE" == "domain" ]]; then
     step "配置 Caddy"
     mkdir -p /etc/caddy
 
-    # 根据验证方式生成 issuers 配置
     local ISSUERS_JSON
     if [[ "$ACME_CHALLENGE" == "dns" ]]; then
       ISSUERS_JSON='[{
@@ -1153,7 +1244,6 @@ EOF
       ISSUERS_JSON='[{ "module": "acme", "email": "'"${EMAIL}"'" }]'
     fi
 
-    # HTTP-01 需要 :80 跳转；DNS-01 关闭自动跳转避免抢占 80
     local SRVH1_BLOCK=""
     local AUTOHTTPS_LINE=""
     if [[ "$ACME_CHALLENGE" == "http" ]]; then
@@ -1218,174 +1308,124 @@ ${SRVH1_BLOCK}        "srvh2": {
 }
 EOF
 
-    # 校验配置（DNS 模式需注入环境变量）
     local VAL_ENV=()
     if [[ "$ACME_CHALLENGE" == "dns" ]]; then
       VAL_ENV=("CF_API_TOKEN=${CF_API_TOKEN}")
     fi
     if ! env "${VAL_ENV[@]}" "$CADDY_BIN" validate --config /etc/caddy/caddy.json >/tmp/caddy_validate.log 2>&1; then
-      warn "Caddy 配置校验失败，原始错误输出："
-      sed 's/^/  | /' /tmp/caddy_validate.log >&2 || cat /tmp/caddy_validate.log >&2
+      warn "Caddy 配置校验失败"
+      cat /tmp/caddy_validate.log
       error "Caddy 配置校验失败"
     fi
     info "Caddy 配置校验通过"
 
-    # 创建简单伪装站点
     step "创建伪装站点"
     mkdir -p /var/www/html
     cat > /var/www/html/index.html <<EOF
 <!DOCTYPE html>
-<html lang="en">
+<html lang="zh-CN">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>${SITE_TITLE}</title>
+  <title>${SITE_TITLE:-Welcome}</title>
   <style>
-    body { font-family: -apple-system, "Segoe UI", Arial, sans-serif; display:flex;
-           align-items:center; justify-content:center; height:100vh; margin:0;
-           background:linear-gradient(135deg,#667eea,#764ba2); color:#fff; }
-    .box { text-align:center; }
-    h1 { font-size:3rem; margin:0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; margin: 0; padding: 40px; background: #f5f5f5; color: #333; }
+    .container { max-width: 600px; margin: 0 auto; background: white; padding: 40px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+    h1 { color: #2c3e50; }
   </style>
 </head>
 <body>
-  <div class="box"><h1>${SITE_TITLE}</h1><p>It works!</p></div>
+  <div class="container">
+    <h1>${SITE_TITLE:-Welcome}</h1>
+    <p>This is a normal website.</p>
+  </div>
 </body>
 </html>
 EOF
-    info "伪装站点已创建"
-
-    # 配置 systemd 服务
-    step "配置 Caddy systemd 服务"
-
-    local ENVFILE_LINE=""
-    if [[ "$ACME_CHALLENGE" == "dns" ]]; then
-      printf 'CF_API_TOKEN=%s\n' "$CF_API_TOKEN" > /etc/caddy/caddy.env
-      chmod 600 /etc/caddy/caddy.env
-      chown root:root /etc/caddy/caddy.env
-      ENVFILE_LINE="EnvironmentFile=/etc/caddy/caddy.env"
-      info "API Token 已写入 /etc/caddy/caddy.env（权限 600）"
-      unset CF_API_TOKEN   # 尽快从内存清除
-    fi
 
     cat > /etc/systemd/system/caddy-json.service <<EOF
 [Unit]
-Description=Caddy JSON Service
+Description=Caddy (JSON config)
 After=network-online.target
 Wants=network-online.target
+
 [Service]
-Type=simple
-${ENVFILE_LINE}
-ExecStart=${CADDY_BIN} run --config /etc/caddy/caddy.json
-Restart=always
-RestartSec=3
+Type=notify
 User=root
+Group=root
+ExecStart=${CADDY_BIN} run --environ --config /etc/caddy/caddy.json
+ExecReload=${CADDY_BIN} reload --config /etc/caddy/caddy.json
+TimeoutStopSec=5s
 LimitNOFILE=1048576
+LimitNPROC=512
+PrivateTmp=true
+ProtectSystem=full
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+Environment=CF_API_TOKEN=${CF_API_TOKEN:-}
+
 [Install]
 WantedBy=multi-user.target
 EOF
+
     systemctl daemon-reload
-    systemctl enable caddy-json.service
-    info "caddy-json.service 已启用"
+    systemctl enable --now caddy-json.service
+    info "Caddy 服务已启动"
   fi
 
-  # ---------- 生成并启动 Xray ----------
-  step "配置并启动 Xray"
-  rebuild_xray_config || error "Xray 配置生成失败"
-  systemctl enable xray
-  systemctl restart xray
-
-  if [[ "$MODE" == "domain" ]]; then
-    step "启动 Caddy"
-    systemctl restart caddy-json.service
-    info "等待 Caddy 启动并申请证书（最多 30 秒）..."
-    for i in $(seq 1 30); do
-      systemctl is-active --quiet caddy-json.service && \
-        ss -tln 2>/dev/null | grep -q '127.0.0.1:8003' && break
-      sleep 1
-    done
+  step "生成并启动 Xray"
+  if rebuild_xray_config; then
+    systemctl enable --now xray
+    info "Xray 服务已启动"
+  else
+    error "Xray 配置生成失败"
   fi
 
-  # ---------- 安装后自检 ----------
   step "安装后自检"
   local SELFCHECK_FAIL=0
 
-  systemctl is-active --quiet xray \
-    && info "xray.service: 运行中" \
-    || { warn "xray 未运行 → journalctl -u xray -n 50 --no-pager"; SELFCHECK_FAIL=1; }
+  if systemctl is-active --quiet xray; then
+    info "xray 运行中"
+  else
+    warn "xray 未运行"
+    SELFCHECK_FAIL=1
+  fi
 
   if [[ "$MODE" == "domain" ]]; then
-    systemctl is-active --quiet caddy-json.service \
-      && info "caddy-json: 运行中" \
-      || { warn "caddy 未运行 → journalctl -u caddy-json -n 50 --no-pager"; SELFCHECK_FAIL=1; }
-
-    if [[ "$ACME_CHALLENGE" == "dns" ]]; then
-      if [[ -x /usr/local/bin/caddy ]] && /usr/local/bin/caddy list-modules 2>/dev/null | grep -q 'dns.providers.cloudflare'; then
-        info "Caddy 已包含 cloudflare DNS 插件"
-      else
-        warn "Caddy 未包含 cloudflare 插件，DNS-01 会失败"; SELFCHECK_FAIL=1
-      fi
-      if ss -tln 2>/dev/null | grep -qE ':80\b' && ss -tlnp 2>/dev/null | grep ':80\b' | grep -q caddy; then
-        warn "检测到 Caddy 正在监听 80 端口，与 DNS-01 模式预期不符"; SELFCHECK_FAIL=1
-      else
-        info "确认 Caddy 未监听 80 端口"
-      fi
-
-      # 等待证书真正签发（最长 120 秒）
-      info "等待 DNS-01 证书签发结果（最长 120 秒，请稍候）..."
-      local CERT_OK=0 i
-      for i in $(seq 1 60); do
-        if check_cert_obtained "$DOMAIN"; then CERT_OK=1; break; fi
-        sleep 2
-      done
-      if [[ $CERT_OK -eq 1 ]]; then
-        info "证书已成功签发（DNS-01 验证通过）"
-      else
-        SELFCHECK_FAIL=1
-        warn "证书尚未签发成功，请查看日志: journalctl -u caddy-json -n 100 --no-pager"
-        warn "常见原因:"
-        warn "  1) API Token 权限不足（需 Zone.Zone:Read + Zone.DNS:Edit，且作用域包含 ${DOMAIN}）"
-        warn "  2) Token 输错或已失效（可在 Cloudflare 后台重新创建）"
-        warn "  3) 域名 NS 未托管在 Cloudflare（DNS-01 要求域名解析在 Cloudflare）"
-        warn "  4) caddy.env 中 CF_API_TOKEN 与 caddy.json 未关联（本版本已修复该问题）"
-      fi
+    if systemctl is-active --quiet caddy-json.service; then
+      info "caddy-json 运行中"
+    else
+      warn "caddy-json 未运行"
+      SELFCHECK_FAIL=1
     fi
   fi
 
-  if ss -tln 2>/dev/null | grep -qE ":${XRAY_PORT}\b"; then
+  if ss -tlnp 2>/dev/null | grep -qE ":${XRAY_PORT}\b"; then
     info "端口 ${XRAY_PORT} 已监听"
-    ss -tlnp 2>/dev/null | grep -E ":${XRAY_PORT}\b" | sed 's/^/       /'
   else
     warn "未发现端口 ${XRAY_PORT} 监听"
     SELFCHECK_FAIL=1
   fi
 
-  echo
-  echo "检查服务器出网情况（REALITY 认证后要靠本机直连出去）："
   if check_outbound; then
     info "出网正常"
   else
     SELFCHECK_FAIL=1
-    warn "服务器出网受限 —— 服务会正常运行，但客户端会『连上却打不开网页』"
-    warn "请检查：机房线路是否屏蔽了目标站点、是否有 DNS 污染、是否被限速"
+    warn "服务器出网受限"
   fi
 
   if [[ "$MODE" == "ip" && -n "${DEST_DOMAIN:-}" ]]; then
-    echo
-    echo "检查伪装目标 ${DEST_DOMAIN} 的 TLS1.3 握手："
     if probe_dest_tls "$DEST_DOMAIN" 443; then
       info "dest 握手正常"
     else
       SELFCHECK_FAIL=1
-      warn "dest 握手异常 —— 客户端会『连上即断』，请重新安装并更换目标"
+      warn "dest 握手异常"
     fi
   fi
 
-  echo
   if [[ $SELFCHECK_FAIL -eq 0 ]]; then
     info "自检全部通过"
   else
-    warn "自检存在问题（见上方红/黄提示），节点可能不可用"
+    warn "自检存在问题"
   fi
 
   echo
@@ -1393,8 +1433,11 @@ EOF
 
   print_port_notice "$MODE" "$XRAY_PORT"
 
-  # 启用自动流量累计定时任务
-  setup_traffic_timer
+  if [[ "${TRAFFIC_STATS:-1}" == "1" ]]; then
+    setup_traffic_timer
+  else
+    info "流量统计为关闭状态，跳过累计定时任务"
+  fi
 
   info "安装完成！"
   read -rp "  按回车返回主菜单..." _
@@ -1414,11 +1457,10 @@ do_uninstall() {
   local MODE=""
   load_kv "$INFO_FILE" 2>/dev/null || true
   [[ -z "$MODE" ]] && MODE="domain"
-  warn "即将卸载（模式: ${MODE}${ACME_CHALLENGE:+, 验证: $ACME_CHALLENGE}）"
+  warn "即将卸载（模式: ${MODE}）"
   read -rp "确认卸载？输入 yes 继续: " CONFIRM
   [[ "$CONFIRM" != "yes" ]] && { info "已取消"; return; }
 
-  # 停止并禁用服务
   systemctl stop xray 2>/dev/null || true
   systemctl disable xray 2>/dev/null || true
 
@@ -1429,34 +1471,20 @@ do_uninstall() {
   fi
   systemctl daemon-reload
 
-  # 清理 Caddy 相关
-  if [[ "$MODE" == "domain" ]] || [[ -d /etc/caddy ]] || systemctl list-unit-files 2>/dev/null | grep -q "^caddy.service"; then
+  if [[ "$MODE" == "domain" ]] || [[ -d /etc/caddy ]]; then
     if dpkg -l 2>/dev/null | grep -q "^ii  caddy "; then
-      info "卸载 Caddy 软件包"
       apt-get purge -y caddy || true
     fi
     rm -f /etc/apt/sources.list.d/caddy-stable.list
     rm -f /usr/share/keyrings/caddy-stable-archive-keyring.gpg
     rm -rf /etc/caddy /var/lib/caddy
-
     rm -f /usr/local/bin/caddy
-    # 清理 Go/xcaddy 编译残留（新版脚本装完即删，此处兜底清理旧版残留）
-    rm -rf /root/.cache/go-build 2>/dev/null || true
-    if command -v go >/dev/null 2>&1; then
-      rm -f "$(go env GOPATH)/bin/xcaddy" 2>/dev/null || true
-    else
-      rm -rf /root/go 2>/dev/null || true
-      rm -rf /usr/local/go 2>/dev/null || true
-    fi
-    info "Caddy 相关文件已清理"
   fi
 
-  # 清理 Xray
   [[ -f /usr/local/bin/xray ]] && \
     bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ remove --purge || true
   rm -rf /usr/local/etc/xray /var/log/xray
 
-  # 可选清理安装信息与伪装站
   read -rp "删除 /etc/reality-caddy ? [y/N]: " DEL
   [[ "${DEL,,}" == "y" ]] && rm -rf /etc/reality-caddy && info "已删除"
 
@@ -1465,33 +1493,22 @@ do_uninstall() {
     [[ "${DEL,,}" == "y" ]] && rm -rf /var/www/html && info "已删除"
   fi
 
-  # 清理流量定时任务
   systemctl disable --now xray-traffic-accumulate.timer 2>/dev/null || true
   systemctl disable --now xray-traffic-accumulate.service 2>/dev/null || true
   rm -f /etc/systemd/system/xray-traffic-accumulate.service \
         /etc/systemd/system/xray-traffic-accumulate.timer
 
-  # 清理 Telegram 日报定时任务
   systemctl disable --now xray-tg-report.timer 2>/dev/null || true
   systemctl disable --now xray-tg-report.service 2>/dev/null || true
   rm -f /etc/systemd/system/xray-tg-report.service \
         /etc/systemd/system/xray-tg-report.timer
 
+  # 清理定时任务助手脚本与 TG 定时启用标记
+  rm -f "$TIMER_HELPER" "$TG_TIMER_ON_FILE"
+
   systemctl daemon-reload 2>/dev/null || true
 
-  echo
-  if [[ "$MODE" == "ip" ]]; then
-    info "IP 模式卸载完成（本机未安装 Caddy，也未部署伪装页面）"
-    warn "如需彻底断服，请记得在云厂商安全组中删除 TCP ${XRAY_PORT:-8443} 的放行规则"
-  else
-    info "域名模式卸载完成"
-    if [[ "${ACME_CHALLENGE:-http}" == "http" ]]; then
-      warn "如需彻底断服，请记得在云厂商安全组中删除 TCP 80/443 的放行规则"
-    else
-      warn "如需彻底断服，请记得在云厂商安全组中删除 Xray 端口对应的放行规则"
-      info "80 端口未由本脚本占用，请勿删除您自己服务的放行规则"
-    fi
-  fi
+  info "卸载完成"
   read -rp "  按回车返回..." _
 }
 
@@ -1521,6 +1538,11 @@ do_status() {
     echo -e "  验证方式  : ${ACME_CHALLENGE:-http}"
   fi
   echo -e "  端口      : ${XRAY_PORT}"
+  if traffic_stats_on; then
+    echo -e "  流量统计  : 开启"
+  else
+    echo -e "  流量统计  : 关闭"
+  fi
   line
   echo
 
@@ -1545,7 +1567,7 @@ do_status() {
 }
 
 # ============================================================================
-# 四、显示客户端参数（内部可复用）
+# 四、显示客户端参数
 # ============================================================================
 show_client_info() {
   load_kv "$INFO_FILE" || { warn "未找到 $INFO_FILE"; return 1; }
@@ -1599,7 +1621,6 @@ show_client_info() {
   if [[ "${TRANSPORT:-tcp}" == "xhttp" ]]; then
     echo -e "  传输        : xhttp"
     echo -e "  路径        : ${XHTTP_PATH:-/xhttp}"
-    echo -e "  模式        : auto"
   else
     echo -e "  流控        : xtls-rprx-vision"
     echo -e "  传输        : tcp"
@@ -1619,15 +1640,8 @@ show_client_info() {
     echo "  vless://${uuid}@${ADDR}:${XRAY_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&headerType=none#Reality-${email:-${ADDR}}"
   fi
   echo -e "${CYAN}  ╰────────────────────────────────────────────╯${NC}"
-
-  if [[ "${MODE:-domain}" == "domain" ]]; then
-    echo -e "  伪装站点    : https://${DOMAIN}"
-  else
-    echo -e "  伪装目标    : ${DEST_DOMAIN}"
-  fi
 }
 
-# 对外入口：查看参数
 do_show_client() {
   clear
   if ! is_installed; then
@@ -1675,7 +1689,6 @@ users_menu() {
   done
 }
 
-# 仅输出用户列表（无等待）
 users_list_noread() {
   printf "  %-4s %-40s %-24s %s\n" "No." "UUID" "标识" "备注"
   line
@@ -1717,7 +1730,7 @@ users_add() {
     systemctl restart xray
     info "Xray 已重启"
   else
-    sed -i '$ d' "$USERS_FILE"   # 回滚最后一行
+    sed -i '$ d' "$USERS_FILE"
     warn "配置失败，已回滚"
   fi
   read -rp "  按回车返回..." _
@@ -1736,18 +1749,17 @@ users_del() {
   users_list_noread
   echo
   read -rp "  输入要删除的用户编号: " IDX
-  [[ ! "$IDX" =~ ^[0-9]+$ ]] && { warn "无效编号"; read -rp "  按回车返回..." _; return; }
+  [[ ! "$IDX" =~ ^[0-9]+$ ]] && { warn "无效编号"; return; }
 
   local total
   total=$(grep -vcE '^\s*(#|$)' "$USERS_FILE" || true)
-  (( IDX < 1 || IDX > total )) && { warn "编号越界"; read -rp "  按回车返回..." _; return; }
+  (( IDX < 1 || IDX > total )) && { warn "编号越界"; return; }
 
   local target_email
   target_email=$(grep -vE '^\s*(#|$)' "$USERS_FILE" | sed -n "${IDX}p" | cut -d'|' -f2)
   read -rp "确认删除 $target_email ? [y/N]: " C
   [[ "${C,,}" != "y" ]] && { info "已取消"; return; }
 
-  # 备份后按行号删除
   cp "$USERS_FILE" "${USERS_FILE}.bak"
   awk -v n="$IDX" '
     BEGIN { c=0 }
@@ -1828,13 +1840,13 @@ users_show() {
 }
 
 # ============================================================================
-# 六、诊断自检（只读，不修改任何配置）
+# 六、诊断自检
 # ============================================================================
 do_diagnose() {
   clear
   banner "诊断自检"
   if [[ ! -f "$INFO_FILE" ]]; then
-    warn "未找到 $INFO_FILE，可能尚未安装"
+    warn "未找到 $INFO_FILE"
     read -rp "  按回车返回..." _
     return
   fi
@@ -1866,16 +1878,15 @@ do_diagnose() {
 
   echo
   echo -e "  ${BOLD}[3] 服务器出网${NC}"
-  check_outbound || warn "出网受限：客户端会『连上但没网』"
+  check_outbound || warn "出网受限"
 
   if [[ "$MODE" == "ip" && -n "$DEST_DOMAIN" ]]; then
     echo
-    echo -e "  ${BOLD}[4] 伪装目标 ${DEST_DOMAIN} 的 TLS1.3 握手${NC}"
+    echo -e "  ${BOLD}[4] 伪装目标 TLS1.3 握手${NC}"
     if probe_dest_tls "$DEST_DOMAIN" 443; then
       info "握手正常"
     else
-      warn "握手异常！这是 IP 模式『连上即断』的典型原因，请换目标重新安装"
-      echo "     手工确认：openssl s_client -connect ${DEST_DOMAIN}:443 -servername ${DEST_DOMAIN} -tls1_3 -brief"
+      warn "握手异常"
     fi
   fi
 
@@ -1883,74 +1894,13 @@ do_diagnose() {
   echo -e "  ${BOLD}[5] 密钥${NC}"
   echo -e "  PublicKey: ${PUBLIC_KEY:-空}  (长度 ${#PUBLIC_KEY})"
   echo -e "  ShortId  : ${SHORT_ID:-空}"
-  [[ ${#PUBLIC_KEY} -lt 40 ]] && warn "PublicKey 长度异常，客户端会失败"
-  if command -v xray >/dev/null 2>&1 && [[ -n "${PRIVATE_KEY:-}" ]]; then
-    local calc
-    calc=$(xray x25519 -i "$PRIVATE_KEY" 2>/dev/null | grep -iE 'public|password' | awk '{print $NF}' | head -1)
-    if [[ -n "$calc" ]]; then
-      [[ "$calc" == "$PUBLIC_KEY" ]] && info "公私钥配对正确" || warn "公私钥不配对！请重建密钥"
-    fi
-  fi
-
-  echo
-  echo -e "  ${BOLD}[6] 证书验证方式${NC}"
-  echo -e "  方式: ${ACME_CHALLENGE:-http}"
-  if [[ "${ACME_CHALLENGE:-http}" == "dns" ]]; then
-    if [[ -s /etc/caddy/caddy.env ]] && grep -q '^CF_API_TOKEN=' /etc/caddy/caddy.env; then
-      info "CF_API_TOKEN 环境文件存在"
-    else
-      warn "/etc/caddy/caddy.env 缺失或为空，证书续期会失败"
-    fi
-    if [[ -x /usr/local/bin/caddy ]]; then
-      if /usr/local/bin/caddy list-modules 2>/dev/null | grep -q 'dns.providers.cloudflare'; then
-        info "Caddy 已包含 cloudflare DNS 插件"
-      else
-        warn "当前 Caddy 未包含 cloudflare 插件，DNS-01 会失败"
-      fi
-    else
-      warn "/usr/local/bin/caddy 不存在（DNS-01 需要 xcaddy 构建版）"
-    fi
-    if ss -tlnp 2>/dev/null | grep ':80\b' | grep -q caddy; then
-      warn "Caddy 正在监听 80，与 DNS-01 预期不符"
-    else
-      info "Caddy 未监听 80"
-    fi
-    if check_cert_obtained "${DOMAIN:-}"; then
-      info "证书已签发（DNS-01 正常）"
-    else
-      warn "未找到已签发的证书，DNS-01 申请可能失败"
-      warn "请检查: journalctl -u caddy-json -n 100 --no-pager"
-      warn "并确认 caddy.json 中 cloudflare provider 含 \"api_token\": \"{env.CF_API_TOKEN}\""
-    fi
-  fi
-
-  echo
-  echo -e "  ${BOLD}[7] 客户端必须核对的三项${NC}"
-  if [[ "$MODE" == "ip" ]]; then
-    echo -e "  地址/SNI : 地址填 IP，SNI 必须填 ${DEST_DOMAIN}（不能填 IP）"
-  else
-    echo -e "  地址/SNI : 都填 ${DOMAIN}"
-  fi
-  echo -e "  PublicKey: 必须是本机 info.txt 里的值（换模式后旧值会失效）"
-  echo -e "  ShortId  : 同上，不能沿用旧节点的"
-
-  echo
-  echo -e "  ${BOLD}[8] xray 近期错误日志${NC}"
-  journalctl -u xray -n 100 --no-pager 2>/dev/null \
-    | grep -iE "rejected|invalid|failed|refused|timeout|no route|address already" \
-    | tail -8 | sed 's/^/  /' || echo "  无明显错误"
 
   echo
   read -rp "  按回车返回..." _
 }
 
 # ============================================================================
-# 七、用户流量统计（长期累计）
-# ============================================================================
-# ============================================================================
-# 流量统计菜单
-# 先调用累计函数把内存中的增量写入文件，再按月聚合显示，并显示总累计
-# 显示时优先使用 users.txt 中的备注字段
+# 七、用户流量统计
 # ============================================================================
 do_traffic() {
   clear
@@ -1961,17 +1911,20 @@ do_traffic() {
     return
   fi
 
+  ensure_python3 || { read -rp "  按回车返回..." _; return; }
+
   load_kv "$INFO_FILE" 2>/dev/null || true
 
-  # 检查是否已启用统计
   if ! grep -q '"stats"' "$XRAY_CONF" 2>/dev/null; then
-    warn "当前 Xray 配置未启用流量统计"
-    echo
+    warn "当前 Xray 配置未启用流量统计（可在 [9] 流量开关中开启）"
     read -rp "  是否现在重建配置并重启 Xray 以启用？[y/N]: " C
     if [[ "${C,,}" == "y" ]]; then
+      set_info_value TRAFFIC_STATS 1
+      TRAFFIC_STATS=1
       if rebuild_xray_config; then
         systemctl restart xray
-        info "配置已重建，Xray 已重启。请等待几秒后重新查看流量。"
+        info "配置已重建，Xray 已重启"
+        ensure_timer_units
       else
         warn "配置重建失败"
       fi
@@ -1986,11 +1939,8 @@ do_traffic() {
     return
   fi
 
-  local API_ADDR="127.0.0.1:10085"
   info "正在查询并累计流量数据..."
-
-  # 先执行一次累计（带 reset）
-  accumulate_traffic_silent || warn "本次累计可能失败，将显示上次保存的数据"
+  accumulate_traffic_silent || warn "本次累计可能失败"
 
   echo
   echo -e "  ${BOLD}用户流量统计（按月汇总，详细历史保留 1 年）${NC}"
@@ -2015,7 +1965,6 @@ cumulative = store.get("cumulative", {})
 daily = store.get("daily", [])
 meta = store.get("_meta", {})
 
-known = []
 email_to_note = {}
 if os.path.isfile(users_file):
     with open(users_file) as f:
@@ -2027,7 +1976,6 @@ if os.path.isfile(users_file):
             if len(parts) >= 2:
                 email = parts[1]
                 note = parts[2] if len(parts) >= 3 else ""
-                known.append(email)
                 email_to_note[email] = note.strip() if note.strip() else email
 
 def display_name(email):
@@ -2044,14 +1992,12 @@ def fmt(b):
     else:
         return f"{b/1024**3:.2f} GB"
 
-# ---------- 按月聚合 ----------
-# month -> email -> {up, down}
 monthly = defaultdict(lambda: defaultdict(lambda: {"uplink": 0, "downlink": 0}))
 for rec in daily:
     date = rec.get("date", "")
     if len(date) < 7:
         continue
-    month = date[:7]  # YYYY-MM
+    month = date[:7]
     for email, d in rec.get("users", {}).items():
         monthly[month][email]["uplink"] += d.get("uplink", 0)
         monthly[month][email]["downlink"] += d.get("downlink", 0)
@@ -2059,7 +2005,6 @@ for rec in daily:
 months = sorted(monthly.keys(), reverse=True)
 
 def display_width(s):
-    """计算字符串在终端的显示宽度（中文算 2）"""
     w = 0
     for c in str(s):
         w += 2 if ord(c) > 127 else 1
@@ -2073,7 +2018,6 @@ def pad(s, width, align="left"):
         return " " * pad_len + s
     return s + " " * pad_len
 
-# 固定列宽
 COL_NAME = 20
 COL_NUM = 12
 
@@ -2087,7 +2031,6 @@ else:
         header = f"    {pad('备注', COL_NAME)} {pad('上行', COL_NUM, 'right')} {pad('下行', COL_NUM, 'right')} {pad('总计', COL_NUM, 'right')}"
         print(header)
         m_up = m_down = 0
-        # 只显示有流量的用户，按总流量从高到低排序
         users_in_month = [e for e in monthly[month].keys()
                           if monthly[month][e]["uplink"] + monthly[month][e]["downlink"] > 0]
         users_in_month.sort(key=lambda e: -(monthly[month][e]["uplink"] + monthly[month][e]["downlink"]))
@@ -2106,10 +2049,9 @@ else:
             print("    本月无流量")
         print()
 
-# ---------- 总累计 ----------
 print("  【总累计（自安装以来）】")
 print()
-active_emails = [e for e in set(list(cumulative.keys()) + known)
+active_emails = [e for e in set(list(cumulative.keys()) + list(email_to_note.keys()))
                  if cumulative.get(e, {}).get("uplink", 0) + cumulative.get(e, {}).get("downlink", 0) > 0]
 active_emails.sort(key=lambda e: -(cumulative.get(e, {}).get("uplink", 0) + cumulative.get(e, {}).get("downlink", 0)))
 print(f"  {pad('备注', COL_NAME)} {pad('上行', COL_NUM, 'right')} {pad('下行', COL_NUM, 'right')} {pad('总计', COL_NUM, 'right')}")
@@ -2140,23 +2082,20 @@ PY
 
   echo
   echo -e "  ${DIM}数据文件: ${TRAFFIC_FILE}${NC}"
-  echo -e "  ${DIM}已启用每小时自动累计（systemd timer）${NC}"
+  if systemctl is-active --quiet xray-traffic-accumulate.timer 2>/dev/null; then
+    echo -e "  ${DIM}每小时自动累计: 已启用（systemd timer）${NC}"
+  else
+    echo -e "  ${DIM}每小时自动累计: 未启用（可在 [9] 流量开关中开启）${NC}"
+  fi
   echo
   read -rp "  按回车返回主菜单..." _
 }
 
 # ============================================================================
-# 静默累计流量（供定时任务和菜单调用）
-# ----------------------------------------------------------------------------
-# 工作流程:
-#   1. 调用 xray api statsquery（不带 reset）获取当前内存中的流量
-#   2. 解析 JSON，提取 user>>>email>>>traffic>>>uplink/downlink
-#      注意：名称用 >>> 分割后只有 4 段，email 在 parts[1]，方向在 parts[3]
-#   3. 累加到 /etc/reality-caddy/traffic.json 的 cumulative 和 daily
-#   4. 成功后再执行一次带 -reset=true 的查询，清空 Xray 内存计数器
-#   5. daily 数组只保留最近 365 天的记录
+# 静默累计流量
 # ============================================================================
 accumulate_traffic_silent() {
+  ensure_python3 || return 1
   [[ ! -f "$INFO_FILE" ]] && return 1
   [[ ! -x /usr/local/bin/xray ]] && return 1
   systemctl is-active --quiet xray || return 1
@@ -2166,14 +2105,12 @@ accumulate_traffic_silent() {
   TMPRAW=$(mktemp)
   TMPOUT=$(mktemp)
 
-  # 不带 reset 查询
   timeout 15 xray api statsquery --server="$API_ADDR" >"$TMPRAW" 2>/dev/null || true
   if [[ ! -s "$TMPRAW" ]]; then
     rm -f "$TMPRAW" "$TMPOUT"
     return 1
   fi
 
-  # 用 Python 处理
   python3 - "$TMPRAW" "$TRAFFIC_FILE" >"$TMPOUT" 2>&1 <<'PY'
 import json, sys, os, time
 from datetime import datetime, timedelta
@@ -2207,8 +2144,6 @@ for item in data.get("stat", []):
             direction = parts[3]
             delta.setdefault(email, {"uplink": 0, "downlink": 0})
             delta[email][direction] = value
-
-print(f"DELTA_COUNT:{len(delta)}", file=sys.stderr)
 
 store = {"cumulative": {}, "daily": [], "_meta": {}}
 if os.path.isfile(traffic_file):
@@ -2265,7 +2200,6 @@ except Exception as e:
     sys.exit(1)
 PY
 
-  # 查询成功后再 reset
   if grep -q "OK" "$TMPOUT" 2>/dev/null; then
     timeout 10 xray api statsquery --server="$API_ADDR" -reset=true >/dev/null 2>&1 || true
   fi
@@ -2274,13 +2208,9 @@ PY
 }
 
 # ============================================================================
-# 安装每小时流量累计定时任务
-# 创建 systemd service + timer，每小时调用本脚本 --accumulate
+# 写入流量累计 systemd 单元（service + timer）
 # ============================================================================
-setup_traffic_timer() {
-  local SCRIPT_PATH
-  SCRIPT_PATH=$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")
-
+write_traffic_units() {
   cat > /etc/systemd/system/xray-traffic-accumulate.service <<EOF
 [Unit]
 Description=Xray Reality Traffic Accumulate
@@ -2288,7 +2218,7 @@ After=xray.service
 
 [Service]
 Type=oneshot
-ExecStart=${SCRIPT_PATH} --accumulate
+ExecStart=${TIMER_HELPER} --accumulate
 User=root
 EOF
 
@@ -2305,14 +2235,51 @@ Persistent=true
 [Install]
 WantedBy=timers.target
 EOF
-
-  systemctl daemon-reload
-  systemctl enable --now xray-traffic-accumulate.timer >/dev/null 2>&1 || true
-  info "已启用每小时自动累计流量定时任务"
 }
 
 # ============================================================================
-# Telegram 日报相关
+# 写入 TG 日报 systemd 单元（service + timer）
+# ============================================================================
+write_tg_units() {
+  cat > /etc/systemd/system/xray-tg-report.service <<EOF
+[Unit]
+Description=Xray Reality Telegram Daily Report
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=${TIMER_HELPER} --tg-report
+User=root
+EOF
+
+  cat > /etc/systemd/system/xray-tg-report.timer <<EOF
+[Unit]
+Description=Daily Telegram Traffic Report at 01:00
+
+[Timer]
+OnCalendar=*-*-* 01:00:00
+Persistent=true
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target
+EOF
+}
+
+# ============================================================================
+# 安装每小时流量累计定时任务（使用固定助手脚本）
+# ============================================================================
+setup_traffic_timer() {
+  install_timer_helper
+  write_traffic_units
+
+  systemctl daemon-reload
+  systemctl enable --now xray-traffic-accumulate.timer >/dev/null 2>&1 || true
+  info "已启用每小时自动累计流量定时任务（独立助手）"
+}
+
+# ============================================================================
+# Telegram 相关函数（简化版，完整逻辑在助手脚本中）
 # ============================================================================
 load_tg_conf() {
   TG_BOT_TOKEN=""
@@ -2349,109 +2316,6 @@ send_tg_message() {
     >/dev/null 2>&1
 }
 
-# ============================================================================
-# 生成 Telegram 昨日流量日报文本
-# 从 traffic.json 的 daily 数组中取出昨天的记录，按用户汇总后格式化成 HTML
-# ============================================================================
-generate_tg_report() {
-  # 先累计一次
-  accumulate_traffic_silent >/dev/null 2>&1 || true
-
-  [[ -f "$TRAFFIC_FILE" ]] || return 1
-
-  # 获取服务器 IP（优先用已保存的，否则实时检测）
-  local SRV_IP=""
-  load_kv "$INFO_FILE" 2>/dev/null || true
-  SRV_IP="${SERVER_IP:-}"
-  [[ -z "$SRV_IP" ]] && SRV_IP=$(get_public_ip 2>/dev/null || echo "未知")
-
-  python3 - "$TRAFFIC_FILE" "$SRV_IP" "$USERS_FILE" <<'PY'
-import json, sys, os
-from datetime import datetime, timedelta
-from collections import defaultdict
-
-try:
-    with open(sys.argv[1]) as f:
-        store = json.load(f)
-except Exception:
-    sys.exit(1)
-
-srv_ip = sys.argv[2] if len(sys.argv) > 2 else "未知"
-users_file = sys.argv[3] if len(sys.argv) > 3 else ""
-
-# email -> note
-email_to_note = {}
-if users_file and os.path.isfile(users_file):
-    with open(users_file) as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            parts = line.split("|")
-            if len(parts) >= 2:
-                email = parts[1]
-                note = parts[2].strip() if len(parts) >= 3 else ""
-                email_to_note[email] = note if note else email
-
-def display_name(email):
-    return email_to_note.get(email, email)
-
-daily = store.get("daily", [])
-yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
-
-# 聚合昨日
-y_users = defaultdict(lambda: {"uplink": 0, "downlink": 0})
-for rec in daily:
-    if rec.get("date") == yesterday:
-        for email, d in rec.get("users", {}).items():
-            y_users[email]["uplink"] += d.get("uplink", 0)
-            y_users[email]["downlink"] += d.get("downlink", 0)
-
-def fmt(b):
-    b = int(b or 0)
-    if b < 1024: return f"{b} B"
-    if b < 1024**2: return f"{b/1024:.1f} KB"
-    if b < 1024**3: return f"{b/1024**2:.1f} MB"
-    return f"{b/1024**3:.2f} GB"
-
-lines = [
-    "📊 <b>Xray Reality 流量日报</b>",
-    f"📅 日期：<code>{yesterday}</code>",
-    f"🖥 服务器：<code>{srv_ip}</code>",
-    ""
-]
-
-if not y_users:
-    lines.append("😴 昨日无流量记录")
-else:
-    total_up = total_down = 0
-    # 按总流量从高到低排序
-    sorted_emails = sorted(y_users.keys(), key=lambda e: -(y_users[e]["uplink"] + y_users[e]["downlink"]))
-    for email in sorted_emails:
-        up = y_users[email]["uplink"]
-        down = y_users[email]["downlink"]
-        total_up += up
-        total_down += down
-        lines.append(f"👤 <b>{display_name(email)}</b>")
-        lines.append(f"   ⬆️ 上行  <code>{fmt(up)}</code>")
-        lines.append(f"   ⬇️ 下行  <code>{fmt(down)}</code>")
-        lines.append("")
-    lines.append(f"📈 <b>合计</b>")
-    lines.append(f"   ⬆️ 上行  <code>{fmt(total_up)}</code>")
-    lines.append(f"   ⬇️ 下行  <code>{fmt(total_down)}</code>")
-    lines.append(f"   📦 总计  <code>{fmt(total_up + total_down)}</code>")
-
-lines.append("")
-lines.append(f"⏰ 生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-
-print("\n".join(lines))
-PY
-}
-
-# ============================================================================
-# Telegram 日报配置菜单
-# 支持：配置 Token/ChatID、测试发送、手动发送昨日日报、启用/关闭每天 01:00 定时推送
-# ============================================================================
 do_telegram() {
   clear
   banner "Telegram 日报设置"
@@ -2496,23 +2360,20 @@ do_telegram() {
       if send_tg_message "✅ Reality 脚本测试消息 $(date '+%Y-%m-%d %H:%M:%S')"; then
         info "测试消息已发送"
       else
-        warn "发送失败，请检查 Token / Chat ID / 网络"
+        warn "发送失败"
       fi
       ;;
     3)
-      local report
-      report=$(generate_tg_report)
-      if [[ -n "$report" ]] && send_tg_message "$report"; then
-        info "日报已发送"
-      else
-        warn "生成或发送失败"
-      fi
+      # 助手脚本缺失时按需生成，避免手动日报因文件丢失而失败
+      [[ -x "$TIMER_HELPER" ]] || install_timer_helper
+      "$TIMER_HELPER" --tg-report && info "日报已发送" || warn "发送失败"
       ;;
     4)
       setup_tg_timer
       ;;
     5)
       systemctl disable --now xray-tg-report.timer 2>/dev/null || true
+      rm -f "$TG_TIMER_ON_FILE"
       info "已关闭自动日报"
       ;;
   esac
@@ -2520,131 +2381,209 @@ do_telegram() {
   read -rp "  按回车返回..." _
 }
 
-# ============================================================================
-# 安装每天 01:00 Telegram 日报定时任务
-# 创建 systemd service + timer，每天凌晨 1 点调用本脚本 --tg-report
-# ============================================================================
 setup_tg_timer() {
-  local SCRIPT_PATH
-  SCRIPT_PATH=$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")
-
-  cat > /etc/systemd/system/xray-tg-report.service <<EOF
-[Unit]
-Description=Xray Reality Telegram Daily Report
-After=network-online.target
-
-[Service]
-Type=oneshot
-ExecStart=${SCRIPT_PATH} --tg-report
-User=root
-EOF
-
-  cat > /etc/systemd/system/xray-tg-report.timer <<EOF
-[Unit]
-Description=Daily Telegram Traffic Report at 01:00
-
-[Timer]
-OnCalendar=*-*-* 01:00:00
-Persistent=true
-AccuracySec=1min
-
-[Install]
-WantedBy=timers.target
-EOF
+  install_timer_helper
+  write_tg_units
 
   systemctl daemon-reload
   systemctl enable --now xray-tg-report.timer >/dev/null 2>&1 || true
-  info "已启用每天 01:00 自动发送 Telegram 日报"
+  mkdir -p "$(dirname "$TG_TIMER_ON_FILE")"
+  : > "$TG_TIMER_ON_FILE"
+  info "已启用每天 01:00 自动发送 Telegram 日报（独立助手）"
 }
 
 # ============================================================================
-# 自动检测并补全定时任务（无需重装）
+# 更新 info.txt 中的单个键值（不存在则追加）
 # ============================================================================
-auto_setup_timers() {
-  [[ ! -f "$INFO_FILE" ]] && return 0
+set_info_value() {
+  local key="$1" val="$2"
+  [[ -f "$INFO_FILE" ]] || return 1
+  if grep -qE "^${key}=" "$INFO_FILE"; then
+    sed -i "s|^${key}=.*|${key}=\"${val}\"|" "$INFO_FILE"
+  else
+    printf '%s="%s"\n' "$key" "$val" >> "$INFO_FILE"
+  fi
+}
 
-  local SCRIPT_PATH
-  SCRIPT_PATH=$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")
+# ============================================================================
+# 打印（quiet 模式下静默）
+# ============================================================================
+qinfo() {
+  local quiet="$1"; shift
+  [[ "$quiet" == "quiet" ]] || info "$*"
+}
+
+# ============================================================================
+# 流量统计是否真的开启（开关状态 + 配置内实际存在 stats 段）
+# ============================================================================
+traffic_stats_on() {
+  [[ "${TRAFFIC_STATS:-1}" == "1" ]] || return 1
+  grep -q '"stats"' "$XRAY_CONF" 2>/dev/null
+}
+
+# ============================================================================
+# 流量统计开关
+#   只在“开启 / 关闭流量统计”时校验并修复定时任务，不再每次进主菜单都跑
+# ============================================================================
+do_traffic_toggle() {
+  clear
+  banner "流量统计开关"
+  if ! is_installed; then
+    warn "尚未安装"
+    read -rp "  按回车返回..." _
+    return
+  fi
+
+  load_kv "$INFO_FILE" 2>/dev/null || true
+  TRAFFIC_STATS=${TRAFFIC_STATS:-1}
+
+  local current="关闭"
+  traffic_stats_on && current="开启"
+
+  echo
+  echo -e "  当前状态：${BOLD}${current}${NC}"
+  line
+  mi 1 "开启流量统计" "启用统计 + 每小时累计 + 可查看报表"
+  mi 2 "关闭流量统计" "停止统计并清理定时任务"
+  line
+  mi 0 "返回" "返回主菜单"
+  echo
+  read -rp "  请选择 [0-2]: " T
+
+  case "$T" in
+    1)
+      # 先落盘开关状态，重建配置时按此值决定是否写入 stats / api 段
+      set_info_value TRAFFIC_STATS 1
+      TRAFFIC_STATS=1
+
+      if rebuild_xray_config; then
+        systemctl restart xray
+        info "校验流量统计定时任务（助手脚本 + systemd 单元）..."
+        ensure_timer_units
+        info "流量统计已开启"
+      else
+        warn "开启失败，流量统计仍为关闭状态"
+      fi
+      ;;
+    2)
+      read -rp "  确认关闭流量统计？[y/N]: " C
+      if [[ "${C,,}" != "y" ]]; then
+        info "已取消"
+      else
+        set_info_value TRAFFIC_STATS 0
+        TRAFFIC_STATS=0
+
+        if rebuild_xray_config; then
+          systemctl restart xray
+          # 统计已关闭：累计与日报定时任务一并停用（历史数据保留）
+          systemctl disable --now xray-traffic-accumulate.timer >/dev/null 2>&1 || true
+          systemctl disable --now xray-tg-report.timer >/dev/null 2>&1 || true
+          rm -f "$TG_TIMER_ON_FILE"
+          info "流量统计已关闭，累计与日报定时任务已停止"
+          echo -e "  ${DIM}历史流量数据保留在 ${TRAFFIC_FILE}${NC}"
+        else
+          set_info_value TRAFFIC_STATS 1
+          TRAFFIC_STATS=1
+          warn "关闭失败，已恢复为开启状态"
+        fi
+      fi
+      ;;
+    *)
+      info "已取消"
+      ;;
+  esac
+  echo
+  read -rp "  按回车返回..." _
+}
+
+# ============================================================================
+# 校验并修复定时任务（助手脚本 + systemd 单元）
+#   仅在“流量统计开启”时调用：
+#     - 助手脚本缺失 / 不可执行 / 内容异常 → 重新生成
+#     - 单元缺失 或 ExecStart 路径不对     → 重建并重新启用
+#     - 用户启用过 TG 日报               → 一并检查修复
+#   用法：ensure_timer_units [quiet]
+# ============================================================================
+ensure_timer_units() {
+  local quiet="${1:-}"
+
+  [[ -f "$INFO_FILE" ]] || return 0
+  [[ "${TRAFFIC_STATS:-1}" == "1" ]] || return 0
 
   local need_reload=0
+  local SVC=/etc/systemd/system/xray-traffic-accumulate.service
+  local TMR=/etc/systemd/system/xray-traffic-accumulate.timer
 
-  # 流量累计 timer
-  if ! systemctl list-unit-files 2>/dev/null | grep -q '^xray-traffic-accumulate.timer'; then
-    cat > /etc/systemd/system/xray-traffic-accumulate.service <<EOF
-[Unit]
-Description=Xray Reality Traffic Accumulate
-After=xray.service
-
-[Service]
-Type=oneshot
-ExecStart=${SCRIPT_PATH} --accumulate
-User=root
-EOF
-    cat > /etc/systemd/system/xray-traffic-accumulate.timer <<EOF
-[Unit]
-Description=Hourly Xray Traffic Accumulate
-
-[Timer]
-OnBootSec=5min
-OnUnitActiveSec=1h
-Persistent=true
-
-[Install]
-WantedBy=timers.target
-EOF
+  # 1) 助手脚本：存在 + 可执行 + 内容可辨认
+  if [[ ! -s "$TIMER_HELPER" || ! -x "$TIMER_HELPER" ]] \
+     || ! grep -q -- '--accumulate' "$TIMER_HELPER" 2>/dev/null; then
+    qinfo "$quiet" "定时助手脚本缺失或异常，正在重建: ${TIMER_HELPER}"
+    install_timer_helper
     need_reload=1
-    info "已自动创建流量累计定时任务（每小时）"
   fi
 
-  # TG 日报 timer（仅当已配置 Token 时才自动启用）
-  if load_tg_conf 2>/dev/null && ! systemctl list-unit-files 2>/dev/null | grep -q '^xray-tg-report.timer'; then
-    cat > /etc/systemd/system/xray-tg-report.service <<EOF
-[Unit]
-Description=Xray Reality Telegram Daily Report
-After=network-online.target
-
-[Service]
-Type=oneshot
-ExecStart=${SCRIPT_PATH} --tg-report
-User=root
-EOF
-    cat > /etc/systemd/system/xray-tg-report.timer <<EOF
-[Unit]
-Description=Daily Telegram Traffic Report at 01:00
-
-[Timer]
-OnCalendar=*-*-* 01:00:00
-Persistent=true
-
-[Install]
-WantedBy=timers.target
-EOF
+  # 2) 流量累计单元：缺失或路径错误 → 重建
+  if [[ ! -f "$SVC" || ! -f "$TMR" ]]; then
+    qinfo "$quiet" "流量累计定时任务缺失，正在重建..."
+    write_traffic_units
     need_reload=1
-    info "已自动创建 TG 日报定时任务（每天 01:00）"
+  elif ! grep -qE "^ExecStart=${TIMER_HELPER} --accumulate$" "$SVC" 2>/dev/null; then
+    qinfo "$quiet" "流量累计定时任务路径异常，正在修复..."
+    write_traffic_units
+    need_reload=1
   fi
 
-  if [[ $need_reload -eq 1 ]]; then
-    systemctl daemon-reload
-    systemctl enable --now xray-traffic-accumulate.timer >/dev/null 2>&1 || true
-    if systemctl list-unit-files 2>/dev/null | grep -q '^xray-tg-report.timer'; then
-      systemctl enable --now xray-tg-report.timer >/dev/null 2>&1 || true
+  # 3) TG 日报单元：仅用户启用过（有标记，或 timer 仍处于启用状态）才检查修复
+  local tg_on=0
+  if [[ -f "$TG_TIMER_ON_FILE" ]]; then
+    tg_on=1
+  elif systemctl is-enabled --quiet xray-tg-report.timer 2>/dev/null; then
+    tg_on=1
+    mkdir -p "$(dirname "$TG_TIMER_ON_FILE")"
+    : > "$TG_TIMER_ON_FILE"
+  fi
+
+  if [[ $tg_on -eq 1 && -f "$TG_CONF" ]]; then
+    local TSVC=/etc/systemd/system/xray-tg-report.service
+    local TTMR=/etc/systemd/system/xray-tg-report.timer
+    if [[ ! -f "$TSVC" || ! -f "$TTMR" ]]; then
+      qinfo "$quiet" "TG 日报定时任务缺失，正在重建..."
+      write_tg_units
+      need_reload=1
+    elif ! grep -qE "^ExecStart=${TIMER_HELPER} --tg-report$" "$TSVC" 2>/dev/null; then
+      qinfo "$quiet" "TG 日报定时任务路径异常，正在修复..."
+      write_tg_units
+      need_reload=1
     fi
+  fi
+
+  [[ $need_reload -eq 1 ]] && systemctl daemon-reload
+
+  # 4) 确保已启用且正在运行
+  if ! systemctl is-enabled --quiet xray-traffic-accumulate.timer 2>/dev/null \
+     || ! systemctl is-active --quiet xray-traffic-accumulate.timer 2>/dev/null; then
+    qinfo "$quiet" "正在启用流量累计定时任务..."
+    systemctl enable --now xray-traffic-accumulate.timer >/dev/null 2>&1 || true
+  fi
+  if [[ $tg_on -eq 1 && -f "$TG_CONF" ]] \
+     && ! systemctl is-enabled --quiet xray-tg-report.timer 2>/dev/null; then
+    qinfo "$quiet" "正在启用 TG 日报定时任务..."
+    systemctl enable --now xray-tg-report.timer >/dev/null 2>&1 || true
   fi
 }
 
 # ============================================================================
 # 主循环
 # ============================================================================
-# 非交互模式
 if [[ "$ACCUMULATE_MODE" == "1" ]]; then
   accumulate_traffic_silent
   exit $?
 fi
 
 if [[ "$TG_REPORT_MODE" == "1" ]]; then
-  report=$(generate_tg_report)
-  if [[ -n "$report" ]]; then
-    send_tg_message "$report" && exit 0
+  if [[ -x "$TIMER_HELPER" ]]; then
+    "$TIMER_HELPER" --tg-report
+    exit $?
   fi
   exit 1
 fi
@@ -2660,6 +2599,7 @@ while true; do
     6) do_diagnose ;;
     7) do_traffic ;;
     8) do_telegram ;;
+    9) do_traffic_toggle ;;
     0) info "再见！"; exit 0 ;;
     *) warn "无效选择"; sleep 1 ;;
   esac
