@@ -496,16 +496,17 @@ show_menu() {
   mi 4 "查看参数" "输出客户端分享链接与详细配置"
   mi 5 "管理用户" "添加 / 删除 / 查看用户"
   mi 6 "诊断自检" "连不上时优先使用（只读）"
-  mi 7 "流量统计" "按月查看用户累计流量"
-  mi 8 "TG 日报" "配置 / 测试 Telegram 每日流量推送"
-  mi 9 "流量开关" "启用 / 关闭流量统计（含定时任务校验）"
+  mi 7 "自动修复" "服务在跑但端口未监听时自动重启修复"
+  mi 8 "流量统计" "按月查看用户累计流量"
+  mi 9 "TG 日报" "配置 / 测试 Telegram 每日流量推送"
+  mi 10 "流量开关" "启用 / 关闭流量统计（含定时任务校验）"
   line
   echo
   mi 0 "退出脚本" "安全退出"
   echo
-  echo -e "  ${YELLOW}提示：连接异常时请先执行 [6] 诊断自检${NC}"
+  echo -e "  ${YELLOW}提示：连接异常时请先执行 [6] 诊断自检，仍不通可试 [7] 自动修复${NC}"
   echo
-  read -rp "  请选择 [0-9]: " CHOICE
+  read -rp "  请选择 [0-10]: " CHOICE
 }
 
 # ============================================================================
@@ -1629,8 +1630,15 @@ EOF
   if ss -tlnp 2>/dev/null | grep -qE ":${XRAY_PORT}\b"; then
     info "端口 ${XRAY_PORT} 已监听"
   else
-    warn "未发现端口 ${XRAY_PORT} 监听"
-    SELFCHECK_FAIL=1
+    warn "未发现端口 ${XRAY_PORT} 监听，尝试自动重启修复..."
+    systemctl restart xray || true
+    sleep 2
+    if ss -tlnp 2>/dev/null | grep -qE ":${XRAY_PORT}\b"; then
+      info "自动修复成功，端口 ${XRAY_PORT} 已监听"
+    else
+      warn "自动修复后仍未监听"
+      SELFCHECK_FAIL=1
+    fi
   fi
 
   if check_outbound; then
@@ -2192,6 +2200,62 @@ do_diagnose() {
 
   echo
   read -rp "  按回车返回..." _
+}
+
+# ============================================================================
+# 自动修复：服务在跑但端口未监听时自动重启
+# ============================================================================
+do_auto_repair() {
+  clear
+  banner "自动修复"
+  if [[ ! -f "$INFO_FILE" ]]; then
+    warn "尚未安装，无需修复"
+    read -rp "  按回车返回..." _
+    return
+  fi
+
+  local MODE="" XRAY_PORT=""
+  load_kv "$INFO_FILE" 2>/dev/null || true
+  XRAY_PORT="${XRAY_PORT:-8443}"
+
+  echo
+  info "正在检查 Xray 服务与端口 ${XRAY_PORT} ..."
+
+  local need_restart=0
+  if ! systemctl is-active --quiet xray; then
+    warn "xray 服务未运行"
+    need_restart=1
+  elif ! ss -tlnp 2>/dev/null | grep -qE ":${XRAY_PORT}\b"; then
+    warn "服务在运行，但端口 ${XRAY_PORT} 未监听（异常状态）"
+    need_restart=1
+  else
+    info "端口 ${XRAY_PORT} 已正常监听，无需修复"
+  fi
+
+  if [[ $need_restart -eq 1 ]]; then
+    info "正在重启 Xray 进行修复..."
+    systemctl restart xray
+    sleep 2
+    if systemctl is-active --quiet xray && ss -tlnp 2>/dev/null | grep -qE ":${XRAY_PORT}\b"; then
+      info "修复成功！端口 ${XRAY_PORT} 已恢复监听"
+    else
+      warn "重启后仍未正常监听，最近日志如下："
+      echo
+      journalctl -u xray -n 30 --no-pager || true
+    fi
+  fi
+
+  echo
+  if command -v xray >/dev/null 2>&1 && [[ -f "${XRAY_CONF:-/usr/local/etc/xray/config.json}" ]]; then
+    if xray -test -config "${XRAY_CONF:-/usr/local/etc/xray/config.json}" >/dev/null 2>&1; then
+      info "配置文件语法正常"
+    else
+      warn "配置文件测试失败，请检查 /usr/local/etc/xray/config.json"
+    fi
+  fi
+
+  echo
+  read -rp "  按回车返回主菜单..." _
 }
 
 # ============================================================================
@@ -2787,9 +2851,10 @@ while true; do
     4) do_show_client ;;
     5) users_menu ;;
     6) do_diagnose ;;
-    7) do_traffic ;;
-    8) do_telegram ;;
-    9) do_traffic_toggle ;;
+    7) do_auto_repair ;;
+    8) do_traffic ;;
+    9) do_telegram ;;
+    10) do_traffic_toggle ;;
     0) info "再见！"; exit 0 ;;
     *) warn "无效选择"; sleep 1 ;;
   esac
